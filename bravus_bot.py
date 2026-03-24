@@ -1,6 +1,7 @@
 import requests
 import time
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 
 # ==============================
@@ -25,17 +26,18 @@ USE_SLOPE_FILTER = True
 USE_SPREAD_FILTER = True
 USE_PERSISTENCE_FILTER = True
 
-MIN_SPREAD_PERC = 0.0005
-BARS_FOR_TREND_HOLD = 2
+MIN_SPREAD_PERC = 0.0015
+BARS_FOR_TREND_HOLD = 4
 
 USE_ATR_FILTER = True
 ATR_LENGTH = 14
 ATR_MIN_MULT = 0.8
 
 USE_IMPULSE_FILTER = True
-MIN_BODY_RATIO = 0.5
+MIN_BODY_RATIO = 0.65
 
 CHECK_EVERY_SECONDS = 60
+MINUTES_BETWEEN_SIGNALS = 20
 
 # ==============================
 # TELEGRAM
@@ -51,7 +53,7 @@ def enviar_mensaje(texto: str) -> None:
         response = requests.post(url, data=data, timeout=20)
         response.raise_for_status()
     except requests.exceptions.RequestException as e:
-        print("Error enviando Telegram:", e)
+        print("Error enviando Telegram:", e, flush=True)
 
 # ==============================
 # DATOS KRAKEN
@@ -324,8 +326,7 @@ def analizar_bravus():
 # ==============================
 def main():
     ultima_senal = None
-
-    enviar_mensaje("🤖 Bravus Bot iniciado correctamente.")
+    ultimo_envio = None
 
     while True:
         try:
@@ -342,7 +343,8 @@ def main():
                 f"bodyRatio: {round(data['body_ratio'], 2)} | impulseOK: {data['impulse_ok']} | "
                 f"bullSlope: {data['bull_slope_ok']} | bearSlope: {data['bear_slope_ok']} | "
                 f"bullBars: {data['bull_persist_bars']} | bearBars: {data['bear_persist_bars']} | "
-                f"newBull: {data['new_bull']} | newBear: {data['new_bear']}"
+                f"newBull: {data['new_bull']} | newBear: {data['new_bear']}",
+                flush=True
             )
 
             if data["long_signal"]:
@@ -369,15 +371,25 @@ def main():
                 senal = "neutral"
                 mensaje = None
 
-            if mensaje and senal != ultima_senal:
+            ahora = datetime.now()
+
+            puede_enviar = False
+            if ultimo_envio is None:
+                puede_enviar = True
+            else:
+                minutos_pasados = (ahora - ultimo_envio).total_seconds() / 60
+                puede_enviar = minutos_pasados >= MINUTES_BETWEEN_SIGNALS
+
+            if mensaje and senal != ultima_senal and puede_enviar:
                 enviar_mensaje(mensaje)
-                print("Mensaje enviado a Telegram")
+                print("Mensaje enviado a Telegram", flush=True)
                 ultima_senal = senal
+                ultimo_envio = ahora
             elif senal == "neutral":
                 ultima_senal = None
 
         except Exception as e:
-            print("Error en Bravus Bot:", e)
+            print("Error en Bravus Bot:", e, flush=True)
 
         time.sleep(CHECK_EVERY_SECONDS)
 
