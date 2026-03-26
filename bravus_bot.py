@@ -47,7 +47,6 @@ USE_IMPULSE_FILTER = True
 
 # Riesgo
 SL_ATR_MULT = 1.5
-TP_ATR_MULT = 3.0
 
 CHECK_EVERY_SECONDS = 60
 MINUTES_BETWEEN_SIGNALS = 30
@@ -82,8 +81,18 @@ def inicializar_csv():
         with open(TRADES_FILE, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "fecha_apertura", "fecha_cierre", "pair", "tipo",
-                "entry", "sl", "tp", "exit", "resultado", "rr"
+                "fecha_apertura",
+                "fecha_cierre",
+                "pair",
+                "tipo",
+                "entry",
+                "sl_inicial",
+                "tp1",
+                "tp2",
+                "tp3",
+                "exit",
+                "resultado",
+                "rr"
             ])
 
 def guardar_trade_cerrado(trade, exit_price, resultado, rr):
@@ -95,8 +104,10 @@ def guardar_trade_cerrado(trade, exit_price, resultado, rr):
             trade["pair"],
             trade["type"],
             trade["entry"],
-            trade["sl"],
-            trade["tp"],
+            trade["sl_inicial"],
+            trade["tp1"],
+            trade["tp2"],
+            trade["tp3"],
             exit_price,
             resultado,
             rr
@@ -316,8 +327,9 @@ def analizar():
     new_bull = bull_strong and not bull_prev_strong
     new_bear = bear_strong and not bear_prev_strong
 
-    trend_bull = close_now > ema200_now
-    trend_bear = close_now < ema200_now
+    # Filtro de tendencia más fuerte
+    trend_bull = close_now > ema200_now and e1_now > ema200_now
+    trend_bear = close_now < ema200_now and e1_now < ema200_now
 
     last = candles[-1]
     open_p = float(last[1])
@@ -368,17 +380,36 @@ def analizar():
     }
 
 # ==============================
-# CONTROL TRADE ABIERTO
+# CONTROL TRADE ABIERTO POR 3 BLOQUES
 # ==============================
-def abrir_trade(tipo, entry, sl, tp):
+def abrir_trade(tipo, entry, atr):
     global open_trade
+
+    if tipo == "buy":
+        sl_inicial = round(entry - atr * SL_ATR_MULT, 2)
+        tp1 = round(entry + atr * 1.0, 2)
+        tp2 = round(entry + atr * 2.0, 2)
+        tp3 = round(entry + atr * 3.0, 2)
+    else:
+        sl_inicial = round(entry + atr * SL_ATR_MULT, 2)
+        tp1 = round(entry - atr * 1.0, 2)
+        tp2 = round(entry - atr * 2.0, 2)
+        tp3 = round(entry - atr * 3.0, 2)
+
     open_trade = {
         "type": tipo,
         "entry": entry,
-        "sl": sl,
-        "tp": tp,
+        "sl_inicial": sl_inicial,
+        "sl_actual": sl_inicial,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
         "pair": PAIR,
-        "open_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "open_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "bloques_restantes": 3,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False
     }
 
 def gestionar_trade(precio_actual):
@@ -387,31 +418,139 @@ def gestionar_trade(precio_actual):
     if open_trade is None:
         return None
 
-    if open_trade["type"] == "buy":
-        if precio_actual <= open_trade["sl"]:
-            guardar_trade_cerrado(open_trade, precio_actual, "SL", -1.0)
-            resultado = "❌ BUY cerrado por SL"
-            open_trade = None
-            return resultado
+    tipo = open_trade["type"]
+    sl_actual = open_trade["sl_actual"]
+    tp1 = open_trade["tp1"]
+    tp2 = open_trade["tp2"]
+    tp3 = open_trade["tp3"]
 
-        if precio_actual >= open_trade["tp"]:
-            guardar_trade_cerrado(open_trade, precio_actual, "TP", 2.0)
-            resultado = "✅ BUY cerrado por TP"
-            open_trade = None
-            return resultado
+    if tipo == "buy":
 
-    elif open_trade["type"] == "sell":
-        if precio_actual >= open_trade["sl"]:
-            guardar_trade_cerrado(open_trade, precio_actual, "SL", -1.0)
-            resultado = "❌ SELL cerrado por SL"
-            open_trade = None
-            return resultado
+        if not open_trade["tp1_hit"] and precio_actual >= tp1:
+            open_trade["tp1_hit"] = True
+            open_trade["bloques_restantes"] = 2
+            open_trade["sl_actual"] = tp1
+            return (
+                f"✅ TP1 alcanzado en BUY\n"
+                f"Precio actual: {precio_actual}\n"
+                f"Bloque 1 cerrado\n"
+                f"Nuevo SL: {open_trade['sl_actual']}\n"
+                f"Quedan 2 bloques"
+            )
 
-        if precio_actual <= open_trade["tp"]:
-            guardar_trade_cerrado(open_trade, precio_actual, "TP", 2.0)
-            resultado = "✅ SELL cerrado por TP"
+        if open_trade["tp1_hit"] and not open_trade["tp2_hit"] and precio_actual >= tp2:
+            open_trade["tp2_hit"] = True
+            open_trade["bloques_restantes"] = 1
+            open_trade["sl_actual"] = tp2
+            return (
+                f"✅ TP2 alcanzado en BUY\n"
+                f"Precio actual: {precio_actual}\n"
+                f"Bloque 2 cerrado\n"
+                f"Nuevo SL: {open_trade['sl_actual']}\n"
+                f"Queda 1 bloque"
+            )
+
+        if open_trade["tp2_hit"] and not open_trade["tp3_hit"] and precio_actual >= tp3:
+            open_trade["tp3_hit"] = True
+            guardar_trade_cerrado(open_trade, precio_actual, "TP3", 3.0)
             open_trade = None
-            return resultado
+            return (
+                f"🚀 TP3 alcanzado en BUY\n"
+                f"Precio actual: {precio_actual}\n"
+                f"Bloque 3 cerrado\n"
+                f"Trade terminado"
+            )
+
+        if precio_actual <= sl_actual:
+            if open_trade["tp2_hit"]:
+                guardar_trade_cerrado(open_trade, precio_actual, "SL_despues_TP2", 2.0)
+                open_trade = None
+                return (
+                    f"⚠️ BUY cerrado por retroceso al TP2\n"
+                    f"Precio actual: {precio_actual}\n"
+                    f"Se cierra el último bloque"
+                )
+
+            elif open_trade["tp1_hit"]:
+                guardar_trade_cerrado(open_trade, precio_actual, "SL_despues_TP1", 1.0)
+                open_trade = None
+                return (
+                    f"⚠️ BUY cerrado por retroceso al TP1\n"
+                    f"Precio actual: {precio_actual}\n"
+                    f"Se cierran los 2 bloques restantes"
+                )
+
+            else:
+                guardar_trade_cerrado(open_trade, precio_actual, "SL", -1.0)
+                open_trade = None
+                return (
+                    f"❌ BUY cerrado por SL inicial\n"
+                    f"Precio actual: {precio_actual}"
+                )
+
+    elif tipo == "sell":
+
+        if not open_trade["tp1_hit"] and precio_actual <= tp1:
+            open_trade["tp1_hit"] = True
+            open_trade["bloques_restantes"] = 2
+            open_trade["sl_actual"] = tp1
+            return (
+                f"✅ TP1 alcanzado en SELL\n"
+                f"Precio actual: {precio_actual}\n"
+                f"Bloque 1 cerrado\n"
+                f"Nuevo SL: {open_trade['sl_actual']}\n"
+                f"Quedan 2 bloques"
+            )
+
+        if open_trade["tp1_hit"] and not open_trade["tp2_hit"] and precio_actual <= tp2:
+            open_trade["tp2_hit"] = True
+            open_trade["bloques_restantes"] = 1
+            open_trade["sl_actual"] = tp2
+            return (
+                f"✅ TP2 alcanzado en SELL\n"
+                f"Precio actual: {precio_actual}\n"
+                f"Bloque 2 cerrado\n"
+                f"Nuevo SL: {open_trade['sl_actual']}\n"
+                f"Queda 1 bloque"
+            )
+
+        if open_trade["tp2_hit"] and not open_trade["tp3_hit"] and precio_actual <= tp3:
+            open_trade["tp3_hit"] = True
+            guardar_trade_cerrado(open_trade, precio_actual, "TP3", 3.0)
+            open_trade = None
+            return (
+                f"🚀 TP3 alcanzado en SELL\n"
+                f"Precio actual: {precio_actual}\n"
+                f"Bloque 3 cerrado\n"
+                f"Trade terminado"
+            )
+
+        if precio_actual >= sl_actual:
+            if open_trade["tp2_hit"]:
+                guardar_trade_cerrado(open_trade, precio_actual, "SL_despues_TP2", 2.0)
+                open_trade = None
+                return (
+                    f"⚠️ SELL cerrado por retroceso al TP2\n"
+                    f"Precio actual: {precio_actual}\n"
+                    f"Se cierra el último bloque"
+                )
+
+            elif open_trade["tp1_hit"]:
+                guardar_trade_cerrado(open_trade, precio_actual, "SL_despues_TP1", 1.0)
+                open_trade = None
+                return (
+                    f"⚠️ SELL cerrado por retroceso al TP1\n"
+                    f"Precio actual: {precio_actual}\n"
+                    f"Se cierran los 2 bloques restantes"
+                )
+
+            else:
+                guardar_trade_cerrado(open_trade, precio_actual, "SL", -1.0)
+                open_trade = None
+                return (
+                    f"❌ SELL cerrado por SL inicial\n"
+                    f"Precio actual: {precio_actual}"
+                )
 
     return None
 
@@ -491,16 +630,21 @@ def main():
             if open_trade is None and atr is not None:
                 if data["long"]:
                     senal = "buy"
-                    sl = round(precio - atr * SL_ATR_MULT, 2)
-                    tp = round(precio + atr * TP_ATR_MULT, 2)
+
+                    sl_inicial = round(precio - atr * SL_ATR_MULT, 2)
+                    tp1 = round(precio + atr * 1.0, 2)
+                    tp2 = round(precio + atr * 2.0, 2)
+                    tp3 = round(precio + atr * 3.0, 2)
 
                     mensaje = (
                         f"🟢 BRAVUS BOT PRO - BUY\n"
                         f"Par: {PAIR}\n"
                         f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
                         f"Precio: {precio}\n"
-                        f"SL: {sl}\n"
-                        f"TP: {tp}\n"
+                        f"SL inicial: {sl_inicial}\n"
+                        f"TP1: {tp1}\n"
+                        f"TP2: {tp2}\n"
+                        f"TP3: {tp3}\n"
                         f"EMA200: {ema200}\n"
                         f"HTF: {data['htf']}\n"
                         f"Spread: {round(data['spread_rel'], 5)}\n"
@@ -510,16 +654,21 @@ def main():
 
                 elif data["short"]:
                     senal = "sell"
-                    sl = round(precio + atr * SL_ATR_MULT, 2)
-                    tp = round(precio - atr * TP_ATR_MULT, 2)
+
+                    sl_inicial = round(precio + atr * SL_ATR_MULT, 2)
+                    tp1 = round(precio - atr * 1.0, 2)
+                    tp2 = round(precio - atr * 2.0, 2)
+                    tp3 = round(precio - atr * 3.0, 2)
 
                     mensaje = (
                         f"🔴 BRAVUS BOT PRO - SELL\n"
                         f"Par: {PAIR}\n"
                         f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
                         f"Precio: {precio}\n"
-                        f"SL: {sl}\n"
-                        f"TP: {tp}\n"
+                        f"SL inicial: {sl_inicial}\n"
+                        f"TP1: {tp1}\n"
+                        f"TP2: {tp2}\n"
+                        f"TP3: {tp3}\n"
                         f"EMA200: {ema200}\n"
                         f"HTF: {data['htf']}\n"
                         f"Spread: {round(data['spread_rel'], 5)}\n"
@@ -538,7 +687,7 @@ def main():
                 if mensaje and senal != ultima_senal and puede_enviar:
                     enviar_mensaje(mensaje)
                     print("ENVIADO:", mensaje, flush=True)
-                    abrir_trade(senal, precio, sl, tp)
+                    abrir_trade(senal, precio, atr)
                     ultima_senal = senal
                     ultimo_envio = ahora
 
@@ -561,4 +710,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
