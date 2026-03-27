@@ -52,11 +52,34 @@ CHECK_EVERY_SECONDS = 60
 MINUTES_BETWEEN_SIGNALS = 30
 
 TRADES_FILE = "trades.csv"
+BALANCE_FILE = "balance_log.csv"
+
+# ==============================
+# SIMULACIÓN
+# ==============================
+INITIAL_BALANCE = 1000.0
+RISK_PER_TRADE = 0.01        # 1% del balance por trade
+MAX_DAILY_LOSS_PERC = 0.03   # 3% pérdida diaria máxima
+TAKER_FEE_RATE = 0.0005      # 0.05% por lado
+
+# Filtros extra de eficiencia
+MIN_ATR_PERC = 0.0004        # evita mercado muerto
+COOLDOWN_TRADES = 2          # ciclos sin abrir trade tras cerrar uno
 
 # ==============================
 # ESTADO GLOBAL
 # ==============================
 open_trade = None
+
+sim_balance = INITIAL_BALANCE
+peak_balance = INITIAL_BALANCE
+max_drawdown_perc = 0.0
+
+current_day = datetime.now().date()
+day_start_balance = INITIAL_BALANCE
+daily_loss_amount = 0.0
+
+trade_cooldown = 0
 
 # ==============================
 # TELEGRAM
@@ -92,10 +115,37 @@ def inicializar_csv():
                 "tp3",
                 "exit",
                 "resultado",
-                "rr"
+                "position_size",
+                "pnl_bruto",
+                "comisiones",
+                "pnl_neto",
+                "balance_antes",
+                "balance_despues"
             ])
 
-def guardar_trade_cerrado(trade, exit_price, resultado, rr):
+    if not os.path.exists(BALANCE_FILE):
+        with open(BALANCE_FILE, mode="w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "fecha",
+                "balance",
+                "peak_balance",
+                "drawdown_perc",
+                "daily_loss_amount"
+            ])
+
+def guardar_balance():
+    with open(BALANCE_FILE, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            round(sim_balance, 2),
+            round(peak_balance, 2),
+            round(max_drawdown_perc, 2),
+            round(daily_loss_amount, 2)
+        ])
+
+def guardar_trade_cerrado(trade, exit_price, resultado):
     with open(TRADES_FILE, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -110,8 +160,75 @@ def guardar_trade_cerrado(trade, exit_price, resultado, rr):
             trade["tp3"],
             exit_price,
             resultado,
-            rr
+            round(trade["position_size"], 8),
+            round(trade["realized_gross_pnl"], 2),
+            round(trade["fees_paid"], 2),
+            round(trade["realized_net_pnl"], 2),
+            round(trade["balance_before_trade"], 2),
+            round(sim_balance, 2)
         ])
+
+# ==============================
+# CAPITAL / RIESGO
+# ==============================
+def enviar_resumen_diario():
+    metricas = calcular_metricas_csv()
+
+    if not metricas:
+        return
+
+    mensaje = (
+        f"📊 RESUMEN DIARIO\n\n"
+        f"Balance: {round(sim_balance, 2)} €\n"
+        f"Net Profit: {metricas['net_profit']} €\n"
+        f"Trades: {metricas['trades']}\n"
+        f"Winrate: {metricas['winrate']}%\n"
+        f"Profit Factor: {metricas['profit_factor']}\n"
+        f"Drawdown max: {round(max_drawdown_perc, 2)}%"
+    )
+
+    enviar_mensaje(mensaje)
+
+def reset_daily_loss_if_new_day():
+    global current_day, day_start_balance, daily_loss_amount
+    hoy = datetime.now().date()
+    if hoy != current_day:
+        enviar_resumen_diario()
+        current_day = hoy
+        day_start_balance = sim_balance
+        daily_loss_amount = 0.0
+
+def puede_operar_por_perdida_diaria():
+    limite = day_start_balance * MAX_DAILY_LOSS_PERC
+    return daily_loss_amount < limite
+
+def actualizar_drawdown():
+    global peak_balance, max_drawdown_perc
+
+    if sim_balance > peak_balance:
+        peak_balance = sim_balance
+
+    if peak_balance > 0:
+        dd = ((peak_balance - sim_balance) / peak_balance) * 100
+        if dd > max_drawdown_perc:
+            max_drawdown_perc = dd
+
+def calcular_risk_amount():
+    return sim_balance * RISK_PER_TRADE
+
+def calcular_position_size(entry, sl):
+    risk_per_unit = abs(entry - sl)
+    if risk_per_unit <= 0:
+        return 0.0
+    return calcular_risk_amount() / risk_per_unit
+
+def aplicar_balance_change(amount):
+    global sim_balance, daily_loss_amount
+    sim_balance += amount
+    if amount < 0:
+        daily_loss_amount += abs(amount)
+    actualizar_drawdown()
+    guardar_balance()
 
 # ==============================
 # DATOS
@@ -348,6 +465,8 @@ def analizar():
     if USE_IMPULSE_FILTER:
         impulse_ok = body_ratio >= MIN_BODY_RATIO
 
+    atr_perc = atr / close_now if atr else 0
+
     long_signal = (
         new_bull and
         trend_bull and
@@ -372,12 +491,48 @@ def analizar():
         "ema6": e6_now,
         "ema200": ema200_now,
         "atr": atr,
+        "atr_perc": atr_perc,
         "spread_rel": spread_rel,
         "body_ratio": body_ratio,
         "htf": "ALCISTA" if htf_bull else "BAJISTA",
         "long": long_signal,
         "short": short_signal
     }
+
+# ==============================
+# GESTIÓN DE TRADE Y PNL
+# ==============================
+def aplicar_fee_entrada(entry_price, position_size):
+    entry_fee = entry_price * position_size * TAKER_FEE_RATE
+    aplicar_balance_change(-entry_fee)
+    return entry_fee
+
+def calcular_pnl_bruto(tipo, entry_price, exit_price, quantity):
+    if tipo == "buy":
+        return (exit_price - entry_price) * quantity
+    return (entry_price - exit_price) * quantity
+
+def cerrar_cantidad(exit_price, quantity):
+    global open_trade
+
+    gross_pnl = calcular_pnl_bruto(
+        open_trade["type"],
+        open_trade["entry"],
+        exit_price,
+        quantity
+    )
+
+    exit_fee = exit_price * quantity * TAKER_FEE_RATE
+    net_pnl = gross_pnl - exit_fee
+
+    open_trade["qty_remaining"] -= quantity
+    open_trade["realized_gross_pnl"] += gross_pnl
+    open_trade["fees_paid"] += exit_fee
+    open_trade["realized_net_pnl"] += net_pnl
+
+    aplicar_balance_change(net_pnl)
+
+    return gross_pnl, exit_fee, net_pnl
 
 # ==============================
 # CONTROL TRADE ABIERTO POR 3 BLOQUES
@@ -396,6 +551,13 @@ def abrir_trade(tipo, entry, atr):
         tp2 = round(entry - atr * 2.0, 2)
         tp3 = round(entry - atr * 3.0, 2)
 
+    position_size = calcular_position_size(entry, sl_inicial)
+    if position_size <= 0:
+        return False
+
+    block_size = position_size / 3.0
+    entry_fee = aplicar_fee_entrada(entry, position_size)
+
     open_trade = {
         "type": tipo,
         "entry": entry,
@@ -409,8 +571,17 @@ def abrir_trade(tipo, entry, atr):
         "bloques_restantes": 3,
         "tp1_hit": False,
         "tp2_hit": False,
-        "tp3_hit": False
+        "tp3_hit": False,
+        "position_size": position_size,
+        "block_size": block_size,
+        "qty_remaining": position_size,
+        "entry_fee_paid": entry_fee,
+        "fees_paid": entry_fee,
+        "realized_gross_pnl": 0.0,
+        "realized_net_pnl": -entry_fee,
+        "balance_before_trade": sim_balance + entry_fee
     }
+    return True
 
 def gestionar_trade(precio_actual):
     global open_trade
@@ -423,6 +594,7 @@ def gestionar_trade(precio_actual):
     tp1 = open_trade["tp1"]
     tp2 = open_trade["tp2"]
     tp3 = open_trade["tp3"]
+    block_size = open_trade["block_size"]
 
     if tipo == "buy":
 
@@ -430,63 +602,108 @@ def gestionar_trade(precio_actual):
             open_trade["tp1_hit"] = True
             open_trade["bloques_restantes"] = 2
             open_trade["sl_actual"] = tp1
-            return (
-                f"✅ TP1 alcanzado en BUY\n"
-                f"Precio actual: {precio_actual}\n"
-                f"Bloque 1 cerrado\n"
-                f"Nuevo SL: {open_trade['sl_actual']}\n"
-                f"Quedan 2 bloques"
-            )
+
+            _, fee, net = cerrar_cantidad(tp1, block_size)
+
+            return {
+                "mensaje": (
+                    f"✅ TP1 alcanzado en BUY\n"
+                    f"Precio de salida: {tp1}\n"
+                    f"Bloque 1 cerrado\n"
+                    f"Nuevo SL: {open_trade['sl_actual']}\n"
+                    f"PnL neto bloque: {round(net, 2)} €\n"
+                    f"Fee salida: {round(fee, 2)} €\n"
+                    f"Quedan 2 bloques"
+                ),
+                "cerrar_trade": False
+            }
 
         if open_trade["tp1_hit"] and not open_trade["tp2_hit"] and precio_actual >= tp2:
             open_trade["tp2_hit"] = True
             open_trade["bloques_restantes"] = 1
             open_trade["sl_actual"] = tp2
-            return (
-                f"✅ TP2 alcanzado en BUY\n"
-                f"Precio actual: {precio_actual}\n"
-                f"Bloque 2 cerrado\n"
-                f"Nuevo SL: {open_trade['sl_actual']}\n"
-                f"Queda 1 bloque"
-            )
+
+            _, fee, net = cerrar_cantidad(tp2, block_size)
+
+            return {
+                "mensaje": (
+                    f"✅ TP2 alcanzado en BUY\n"
+                    f"Precio de salida: {tp2}\n"
+                    f"Bloque 2 cerrado\n"
+                    f"Nuevo SL: {open_trade['sl_actual']}\n"
+                    f"PnL neto bloque: {round(net, 2)} €\n"
+                    f"Fee salida: {round(fee, 2)} €\n"
+                    f"Queda 1 bloque"
+                ),
+                "cerrar_trade": False
+            }
 
         if open_trade["tp2_hit"] and not open_trade["tp3_hit"] and precio_actual >= tp3:
             open_trade["tp3_hit"] = True
-            guardar_trade_cerrado(open_trade, precio_actual, "TP3", 3.0)
+
+            _, fee, net = cerrar_cantidad(tp3, open_trade["qty_remaining"])
+            guardar_trade_cerrado(open_trade, tp3, "TP3")
             open_trade = None
-            return (
-                f"🚀 TP3 alcanzado en BUY\n"
-                f"Precio actual: {precio_actual}\n"
-                f"Bloque 3 cerrado\n"
-                f"Trade terminado"
-            )
+
+            return {
+                "mensaje": (
+                    f"🚀 TP3 alcanzado en BUY\n"
+                    f"Precio de salida: {tp3}\n"
+                    f"Bloque 3 cerrado\n"
+                    f"PnL neto bloque: {round(net, 2)} €\n"
+                    f"Fee salida: {round(fee, 2)} €\n"
+                    f"Trade terminado"
+                ),
+                "cerrar_trade": True
+            }
 
         if precio_actual <= sl_actual:
             if open_trade["tp2_hit"]:
-                guardar_trade_cerrado(open_trade, precio_actual, "SL_despues_TP2", 2.0)
+                _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
+                guardar_trade_cerrado(open_trade, sl_actual, "SL_despues_TP2")
                 open_trade = None
-                return (
-                    f"⚠️ BUY cerrado por retroceso al TP2\n"
-                    f"Precio actual: {precio_actual}\n"
-                    f"Se cierra el último bloque"
-                )
+
+                return {
+                    "mensaje": (
+                        f"⚠️ BUY cerrado por retroceso al TP2\n"
+                        f"Precio de salida: {sl_actual}\n"
+                        f"Se cierra el último bloque\n"
+                        f"PnL neto bloque: {round(net, 2)} €\n"
+                        f"Fee salida: {round(fee, 2)} €"
+                    ),
+                    "cerrar_trade": True
+                }
 
             elif open_trade["tp1_hit"]:
-                guardar_trade_cerrado(open_trade, precio_actual, "SL_despues_TP1", 1.0)
+                _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
+                guardar_trade_cerrado(open_trade, sl_actual, "SL_despues_TP1")
                 open_trade = None
-                return (
-                    f"⚠️ BUY cerrado por retroceso al TP1\n"
-                    f"Precio actual: {precio_actual}\n"
-                    f"Se cierran los 2 bloques restantes"
-                )
+
+                return {
+                    "mensaje": (
+                        f"⚠️ BUY cerrado por retroceso al TP1\n"
+                        f"Precio de salida: {sl_actual}\n"
+                        f"Se cierran los 2 bloques restantes\n"
+                        f"PnL neto resto: {round(net, 2)} €\n"
+                        f"Fee salida: {round(fee, 2)} €"
+                    ),
+                    "cerrar_trade": True
+                }
 
             else:
-                guardar_trade_cerrado(open_trade, precio_actual, "SL", -1.0)
+                _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
+                guardar_trade_cerrado(open_trade, sl_actual, "SL")
                 open_trade = None
-                return (
-                    f"❌ BUY cerrado por SL inicial\n"
-                    f"Precio actual: {precio_actual}"
-                )
+
+                return {
+                    "mensaje": (
+                        f"❌ BUY cerrado por SL inicial\n"
+                        f"Precio de salida: {sl_actual}\n"
+                        f"PnL neto trade: {round(net, 2)} €\n"
+                        f"Fee salida: {round(fee, 2)} €"
+                    ),
+                    "cerrar_trade": True
+                }
 
     elif tipo == "sell":
 
@@ -494,63 +711,108 @@ def gestionar_trade(precio_actual):
             open_trade["tp1_hit"] = True
             open_trade["bloques_restantes"] = 2
             open_trade["sl_actual"] = tp1
-            return (
-                f"✅ TP1 alcanzado en SELL\n"
-                f"Precio actual: {precio_actual}\n"
-                f"Bloque 1 cerrado\n"
-                f"Nuevo SL: {open_trade['sl_actual']}\n"
-                f"Quedan 2 bloques"
-            )
+
+            _, fee, net = cerrar_cantidad(tp1, block_size)
+
+            return {
+                "mensaje": (
+                    f"✅ TP1 alcanzado en SELL\n"
+                    f"Precio de salida: {tp1}\n"
+                    f"Bloque 1 cerrado\n"
+                    f"Nuevo SL: {open_trade['sl_actual']}\n"
+                    f"PnL neto bloque: {round(net, 2)} €\n"
+                    f"Fee salida: {round(fee, 2)} €\n"
+                    f"Quedan 2 bloques"
+                ),
+                "cerrar_trade": False
+            }
 
         if open_trade["tp1_hit"] and not open_trade["tp2_hit"] and precio_actual <= tp2:
             open_trade["tp2_hit"] = True
             open_trade["bloques_restantes"] = 1
             open_trade["sl_actual"] = tp2
-            return (
-                f"✅ TP2 alcanzado en SELL\n"
-                f"Precio actual: {precio_actual}\n"
-                f"Bloque 2 cerrado\n"
-                f"Nuevo SL: {open_trade['sl_actual']}\n"
-                f"Queda 1 bloque"
-            )
+
+            _, fee, net = cerrar_cantidad(tp2, block_size)
+
+            return {
+                "mensaje": (
+                    f"✅ TP2 alcanzado en SELL\n"
+                    f"Precio de salida: {tp2}\n"
+                    f"Bloque 2 cerrado\n"
+                    f"Nuevo SL: {open_trade['sl_actual']}\n"
+                    f"PnL neto bloque: {round(net, 2)} €\n"
+                    f"Fee salida: {round(fee, 2)} €\n"
+                    f"Queda 1 bloque"
+                ),
+                "cerrar_trade": False
+            }
 
         if open_trade["tp2_hit"] and not open_trade["tp3_hit"] and precio_actual <= tp3:
             open_trade["tp3_hit"] = True
-            guardar_trade_cerrado(open_trade, precio_actual, "TP3", 3.0)
+
+            _, fee, net = cerrar_cantidad(tp3, open_trade["qty_remaining"])
+            guardar_trade_cerrado(open_trade, tp3, "TP3")
             open_trade = None
-            return (
-                f"🚀 TP3 alcanzado en SELL\n"
-                f"Precio actual: {precio_actual}\n"
-                f"Bloque 3 cerrado\n"
-                f"Trade terminado"
-            )
+
+            return {
+                "mensaje": (
+                    f"🚀 TP3 alcanzado en SELL\n"
+                    f"Precio de salida: {tp3}\n"
+                    f"Bloque 3 cerrado\n"
+                    f"PnL neto bloque: {round(net, 2)} €\n"
+                    f"Fee salida: {round(fee, 2)} €\n"
+                    f"Trade terminado"
+                ),
+                "cerrar_trade": True
+            }
 
         if precio_actual >= sl_actual:
             if open_trade["tp2_hit"]:
-                guardar_trade_cerrado(open_trade, precio_actual, "SL_despues_TP2", 2.0)
+                _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
+                guardar_trade_cerrado(open_trade, sl_actual, "SL_despues_TP2")
                 open_trade = None
-                return (
-                    f"⚠️ SELL cerrado por retroceso al TP2\n"
-                    f"Precio actual: {precio_actual}\n"
-                    f"Se cierra el último bloque"
-                )
+
+                return {
+                    "mensaje": (
+                        f"⚠️ SELL cerrado por retroceso al TP2\n"
+                        f"Precio de salida: {sl_actual}\n"
+                        f"Se cierra el último bloque\n"
+                        f"PnL neto bloque: {round(net, 2)} €\n"
+                        f"Fee salida: {round(fee, 2)} €"
+                    ),
+                    "cerrar_trade": True
+                }
 
             elif open_trade["tp1_hit"]:
-                guardar_trade_cerrado(open_trade, precio_actual, "SL_despues_TP1", 1.0)
+                _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
+                guardar_trade_cerrado(open_trade, sl_actual, "SL_despues_TP1")
                 open_trade = None
-                return (
-                    f"⚠️ SELL cerrado por retroceso al TP1\n"
-                    f"Precio actual: {precio_actual}\n"
-                    f"Se cierran los 2 bloques restantes"
-                )
+
+                return {
+                    "mensaje": (
+                        f"⚠️ SELL cerrado por retroceso al TP1\n"
+                        f"Precio de salida: {sl_actual}\n"
+                        f"Se cierran los 2 bloques restantes\n"
+                        f"PnL neto resto: {round(net, 2)} €\n"
+                        f"Fee salida: {round(fee, 2)} €"
+                    ),
+                    "cerrar_trade": True
+                }
 
             else:
-                guardar_trade_cerrado(open_trade, precio_actual, "SL", -1.0)
+                _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
+                guardar_trade_cerrado(open_trade, sl_actual, "SL")
                 open_trade = None
-                return (
-                    f"❌ SELL cerrado por SL inicial\n"
-                    f"Precio actual: {precio_actual}"
-                )
+
+                return {
+                    "mensaje": (
+                        f"❌ SELL cerrado por SL inicial\n"
+                        f"Precio de salida: {sl_actual}\n"
+                        f"PnL neto trade: {round(net, 2)} €\n"
+                        f"Fee salida: {round(fee, 2)} €"
+                    ),
+                    "cerrar_trade": True
+                }
 
     return None
 
@@ -567,28 +829,30 @@ def calcular_metricas_csv():
     if not rows:
         return None
 
-    rr_list = [float(r["rr"]) for r in rows]
-    wins = [x for x in rr_list if x > 0]
-    losses = [x for x in rr_list if x < 0]
+    pnl_list = [float(r["pnl_neto"]) for r in rows]
+    wins = [x for x in pnl_list if x > 0]
+    losses = [x for x in pnl_list if x < 0]
 
-    winrate = (len(wins) / len(rr_list)) * 100 if rr_list else 0
+    winrate = (len(wins) / len(pnl_list)) * 100 if pnl_list else 0
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0
 
     return {
-        "trades": len(rr_list),
+        "trades": len(pnl_list),
         "winrate": round(winrate, 2),
-        "profit_factor": round(profit_factor, 2)
+        "profit_factor": round(profit_factor, 2),
+        "net_profit": round(sum(pnl_list), 2)
     }
 
 # ==============================
 # BOT
 # ==============================
 def main():
-    global open_trade
+    global open_trade, trade_cooldown
 
     inicializar_csv()
+    guardar_balance()
 
     ultima_senal = None
     ultimo_envio = None
@@ -596,11 +860,16 @@ def main():
     enviar_mensaje(
         f"🚀 BRAVUS BOT PRO ACTIVADO\n"
         f"Par: {PAIR}\n"
-        f"TF: {INTERVAL}m | HTF: {HTF_INTERVAL}m"
+        f"TF: {INTERVAL}m | HTF: {HTF_INTERVAL}m\n"
+        f"Balance inicial: {round(sim_balance, 2)} €\n"
+        f"Riesgo por trade: {round(RISK_PER_TRADE * 100, 2)}%\n"
+        f"Comisión simulada por lado: {round(TAKER_FEE_RATE * 100, 4)}%"
     )
 
     while True:
         try:
+            reset_daily_loss_if_new_day()
+
             data = analizar()
 
             precio = round(data["close"], 2)
@@ -611,23 +880,34 @@ def main():
 
             print(
                 f"Precio: {precio} | EMA1: {ema1} | EMA6: {ema6} | EMA200: {ema200} | "
-                f"ATR: {round(atr, 2) if atr else None} | Spread: {round(data['spread_rel'], 5)} | "
-                f"BodyRatio: {round(data['body_ratio'], 2)} | HTF: {data['htf']} | "
-                f"OpenTrade: {open_trade['type'] if open_trade else 'NO'}",
+                f"ATR: {round(atr, 2) if atr else None} | ATR%: {round(data['atr_perc'], 5)} | "
+                f"Spread: {round(data['spread_rel'], 5)} | BodyRatio: {round(data['body_ratio'], 2)} | "
+                f"HTF: {data['htf']} | OpenTrade: {open_trade['type'] if open_trade else 'NO'} | "
+                f"Cooldown: {trade_cooldown} | Balance: {round(sim_balance, 2)} € | "
+                f"DD max: {round(max_drawdown_perc, 2)}%",
                 flush=True
             )
 
             ahora = datetime.now()
 
-            cierre = gestionar_trade(precio)
-            if cierre:
+            evento = gestionar_trade(precio)
+            if evento:
                 enviar_mensaje(
-                    f"{cierre}\n"
+                    f"{evento['mensaje']}\n"
                     f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"Precio actual: {precio}"
+                    f"Balance actual: {round(sim_balance, 2)} €"
                 )
 
-            if open_trade is None and atr is not None:
+                if evento["cerrar_trade"]:
+                    trade_cooldown = COOLDOWN_TRADES
+
+            if (
+                open_trade is None
+                and atr is not None
+                and puede_operar_por_perdida_diaria()
+                and trade_cooldown == 0
+                and data["atr_perc"] > MIN_ATR_PERC
+            ):
                 if data["long"]:
                     senal = "buy"
 
@@ -635,6 +915,8 @@ def main():
                     tp1 = round(precio + atr * 1.0, 2)
                     tp2 = round(precio + atr * 2.0, 2)
                     tp3 = round(precio + atr * 3.0, 2)
+                    position_size = calcular_position_size(precio, sl_inicial)
+                    entry_fee_est = precio * position_size * TAKER_FEE_RATE
 
                     mensaje = (
                         f"🟢 BRAVUS BOT PRO - BUY\n"
@@ -649,7 +931,11 @@ def main():
                         f"HTF: {data['htf']}\n"
                         f"Spread: {round(data['spread_rel'], 5)}\n"
                         f"ATR: {round(atr, 2)}\n"
-                        f"BodyRatio: {round(data['body_ratio'], 2)}"
+                        f"ATR%: {round(data['atr_perc'], 5)}\n"
+                        f"BodyRatio: {round(data['body_ratio'], 2)}\n"
+                        f"Tamaño posición: {round(position_size, 6)}\n"
+                        f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
+                        f"Balance: {round(sim_balance, 2)} €"
                     )
 
                 elif data["short"]:
@@ -659,6 +945,8 @@ def main():
                     tp1 = round(precio - atr * 1.0, 2)
                     tp2 = round(precio - atr * 2.0, 2)
                     tp3 = round(precio - atr * 3.0, 2)
+                    position_size = calcular_position_size(precio, sl_inicial)
+                    entry_fee_est = precio * position_size * TAKER_FEE_RATE
 
                     mensaje = (
                         f"🔴 BRAVUS BOT PRO - SELL\n"
@@ -673,7 +961,11 @@ def main():
                         f"HTF: {data['htf']}\n"
                         f"Spread: {round(data['spread_rel'], 5)}\n"
                         f"ATR: {round(atr, 2)}\n"
-                        f"BodyRatio: {round(data['body_ratio'], 2)}"
+                        f"ATR%: {round(data['atr_perc'], 5)}\n"
+                        f"BodyRatio: {round(data['body_ratio'], 2)}\n"
+                        f"Tamaño posición: {round(position_size, 6)}\n"
+                        f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
+                        f"Balance: {round(sim_balance, 2)} €"
                     )
                 else:
                     senal = "neutral"
@@ -685,21 +977,31 @@ def main():
                 )
 
                 if mensaje and senal != ultima_senal and puede_enviar:
-                    enviar_mensaje(mensaje)
-                    print("ENVIADO:", mensaje, flush=True)
-                    abrir_trade(senal, precio, atr)
-                    ultima_senal = senal
-                    ultimo_envio = ahora
+                    trade_opened = abrir_trade(senal, precio, atr)
+                    if trade_opened:
+                        enviar_mensaje(mensaje)
+                        print("ENVIADO:", mensaje, flush=True)
+                        ultima_senal = senal
+                        ultimo_envio = ahora
 
                 if senal == "neutral":
                     ultima_senal = None
+
+            if trade_cooldown > 0:
+                trade_cooldown -= 1
+
+            if not puede_operar_por_perdida_diaria():
+                print("Límite de pérdida diaria alcanzado. No se abren más trades hoy.", flush=True)
 
             metricas = calcular_metricas_csv()
             if metricas:
                 print(
                     f"Trades: {metricas['trades']} | "
                     f"Winrate: {metricas['winrate']}% | "
-                    f"Profit Factor: {metricas['profit_factor']}",
+                    f"Profit Factor: {metricas['profit_factor']} | "
+                    f"Net Profit: {metricas['net_profit']} € | "
+                    f"Balance: {round(sim_balance, 2)} € | "
+                    f"DD max: {round(max_drawdown_perc, 2)}%",
                     flush=True
                 )
 
