@@ -37,7 +37,7 @@ MIN_SPREAD_PERC = 0.0008
 BARS_FOR_TREND_HOLD = 4
 ATR_LENGTH = 14
 ATR_MIN_MULT = 0.8
-MIN_BODY_RATIO = 0.65
+MIN_BODY_RATIO = 0.8
 
 USE_SLOPE_FILTER = True
 USE_SPREAD_FILTER = True
@@ -64,7 +64,8 @@ TAKER_FEE_RATE = 0.0005      # 0.05% por lado
 
 # Filtros extra de eficiencia
 MIN_ATR_PERC = 0.0004        # evita mercado muerto
-COOLDOWN_TRADES = 2          # ciclos sin abrir trade tras cerrar uno
+COOLDOWN_TRADES = 10         # ciclos sin abrir trade tras cerrar uno
+MAX_DISTANCE_EMA200 = 0.01   # evita entrar demasiado lejos de la EMA200
 
 # ==============================
 # ESTADO GLOBAL
@@ -444,9 +445,10 @@ def analizar():
     new_bull = bull_strong and not bull_prev_strong
     new_bear = bear_strong and not bear_prev_strong
 
-    # Filtro de tendencia más fuerte
     trend_bull = close_now > ema200_now and e1_now > ema200_now
     trend_bear = close_now < ema200_now and e1_now < ema200_now
+
+    distance_from_ema200 = abs(close_now - ema200_now) / close_now if close_now != 0 else 0
 
     last = candles[-1]
     open_p = float(last[1])
@@ -473,7 +475,8 @@ def analizar():
         htf_bull and
         atr_ok and
         impulse_ok and
-        bull_candle
+        bull_candle and
+        distance_from_ema200 < MAX_DISTANCE_EMA200
     )
 
     short_signal = (
@@ -482,7 +485,8 @@ def analizar():
         htf_bear and
         atr_ok and
         impulse_ok and
-        bear_candle
+        bear_candle and
+        distance_from_ema200 < MAX_DISTANCE_EMA200
     )
 
     return {
@@ -494,6 +498,7 @@ def analizar():
         "atr_perc": atr_perc,
         "spread_rel": spread_rel,
         "body_ratio": body_ratio,
+        "distance_from_ema200": distance_from_ema200,
         "htf": "ALCISTA" if htf_bull else "BAJISTA",
         "long": long_signal,
         "short": short_signal
@@ -882,6 +887,7 @@ def main():
                 f"Precio: {precio} | EMA1: {ema1} | EMA6: {ema6} | EMA200: {ema200} | "
                 f"ATR: {round(atr, 2) if atr else None} | ATR%: {round(data['atr_perc'], 5)} | "
                 f"Spread: {round(data['spread_rel'], 5)} | BodyRatio: {round(data['body_ratio'], 2)} | "
+                f"DistEMA200: {round(data['distance_from_ema200'], 5)} | "
                 f"HTF: {data['htf']} | OpenTrade: {open_trade['type'] if open_trade else 'NO'} | "
                 f"Cooldown: {trade_cooldown} | Balance: {round(sim_balance, 2)} € | "
                 f"DD max: {round(max_drawdown_perc, 2)}%",
@@ -932,6 +938,7 @@ def main():
                         f"Spread: {round(data['spread_rel'], 5)}\n"
                         f"ATR: {round(atr, 2)}\n"
                         f"ATR%: {round(data['atr_perc'], 5)}\n"
+                        f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
                         f"BodyRatio: {round(data['body_ratio'], 2)}\n"
                         f"Tamaño posición: {round(position_size, 6)}\n"
                         f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
@@ -962,6 +969,7 @@ def main():
                         f"Spread: {round(data['spread_rel'], 5)}\n"
                         f"ATR: {round(atr, 2)}\n"
                         f"ATR%: {round(data['atr_perc'], 5)}\n"
+                        f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
                         f"BodyRatio: {round(data['body_ratio'], 2)}\n"
                         f"Tamaño posición: {round(position_size, 6)}\n"
                         f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
