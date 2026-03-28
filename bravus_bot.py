@@ -33,7 +33,7 @@ LEN_EMA6 = 60
 LEN_EMA_TREND = 200
 
 # Filtros
-MIN_SPREAD_PERC = 0.0008
+MIN_SPREAD_PERC = 0.0012
 BARS_FOR_TREND_HOLD = 4
 ATR_LENGTH = 14
 ATR_MIN_MULT = 0.8
@@ -47,6 +47,9 @@ USE_IMPULSE_FILTER = True
 
 # Riesgo
 SL_ATR_MULT = 1.5
+TP1_ATR_MULT = 1.5
+TP2_ATR_MULT = 3.0
+TP3_ATR_MULT = 5.0
 
 CHECK_EVERY_SECONDS = 60
 MINUTES_BETWEEN_SIGNALS = 30
@@ -58,14 +61,14 @@ BALANCE_FILE = "balance_log.csv"
 # SIMULACIÓN
 # ==============================
 INITIAL_BALANCE = 1000.0
-RISK_PER_TRADE = 0.01        # 1% del balance por trade
-MAX_DAILY_LOSS_PERC = 0.03   # 3% pérdida diaria máxima
-TAKER_FEE_RATE = 0.0005      # 0.05% por lado
+RISK_PER_TRADE = 0.003      # 0.3% del balance por trade
+MAX_DAILY_LOSS_PERC = 0.03  # 3% pérdida diaria máxima
+TAKER_FEE_RATE = 0.0005     # 0.05% por lado
 
 # Filtros extra de eficiencia
-MIN_ATR_PERC = 0.0004        # evita mercado muerto
-COOLDOWN_TRADES = 10         # ciclos sin abrir trade tras cerrar uno
-MAX_DISTANCE_EMA200 = 0.01   # evita entrar demasiado lejos de la EMA200
+MIN_ATR_PERC = 0.0007
+COOLDOWN_TRADES = 10
+MAX_DISTANCE_EMA200 = 0.01
 
 # ==============================
 # ESTADO GLOBAL
@@ -187,7 +190,6 @@ def enviar_resumen_diario():
         f"Profit Factor: {metricas['profit_factor']}\n"
         f"Drawdown max: {round(max_drawdown_perc, 2)}%"
     )
-
     enviar_mensaje(mensaje)
 
 def reset_daily_loss_if_new_day():
@@ -244,8 +246,6 @@ def obtener_ohlc(interval):
 
     result = data["result"]
     pair_key = [k for k in result.keys() if k != "last"][0]
-
-    # Quitamos la última vela porque puede estar en formación
     return result[pair_key][:-1]
 
 # ==============================
@@ -299,6 +299,13 @@ def calcular_atr(candles, period=14):
         return None
 
     return sum(tr[-period:]) / period
+
+def trade_valido(entry, atr, position_size):
+    # Movimiento estimado útil mínimo
+    movimiento_estimado = atr * position_size * 2
+    # Fee aproximada ida y vuelta
+    fee_total = entry * position_size * TAKER_FEE_RATE * 2
+    return movimiento_estimado > fee_total * 1.5
 
 # ==============================
 # ANÁLISIS
@@ -547,14 +554,14 @@ def abrir_trade(tipo, entry, atr):
 
     if tipo == "buy":
         sl_inicial = round(entry - atr * SL_ATR_MULT, 2)
-        tp1 = round(entry + atr * 1.0, 2)
-        tp2 = round(entry + atr * 2.0, 2)
-        tp3 = round(entry + atr * 3.0, 2)
+        tp1 = round(entry + atr * TP1_ATR_MULT, 2)
+        tp2 = round(entry + atr * TP2_ATR_MULT, 2)
+        tp3 = round(entry + atr * TP3_ATR_MULT, 2)
     else:
         sl_inicial = round(entry + atr * SL_ATR_MULT, 2)
-        tp1 = round(entry - atr * 1.0, 2)
-        tp2 = round(entry - atr * 2.0, 2)
-        tp3 = round(entry - atr * 3.0, 2)
+        tp1 = round(entry - atr * TP1_ATR_MULT, 2)
+        tp2 = round(entry - atr * TP2_ATR_MULT, 2)
+        tp3 = round(entry - atr * TP3_ATR_MULT, 2)
 
     position_size = calcular_position_size(entry, sl_inicial)
     if position_size <= 0:
@@ -914,67 +921,79 @@ def main():
                 and trade_cooldown == 0
                 and data["atr_perc"] > MIN_ATR_PERC
             ):
+                trade_descartado = False
+
                 if data["long"]:
                     senal = "buy"
 
                     sl_inicial = round(precio - atr * SL_ATR_MULT, 2)
-                    tp1 = round(precio + atr * 1.0, 2)
-                    tp2 = round(precio + atr * 2.0, 2)
-                    tp3 = round(precio + atr * 3.0, 2)
+                    tp1 = round(precio + atr * TP1_ATR_MULT, 2)
+                    tp2 = round(precio + atr * TP2_ATR_MULT, 2)
+                    tp3 = round(precio + atr * TP3_ATR_MULT, 2)
                     position_size = calcular_position_size(precio, sl_inicial)
-                    entry_fee_est = precio * position_size * TAKER_FEE_RATE
 
-                    mensaje = (
-                        f"🟢 BRAVUS BOT PRO - BUY\n"
-                        f"Par: {PAIR}\n"
-                        f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"Precio: {precio}\n"
-                        f"SL inicial: {sl_inicial}\n"
-                        f"TP1: {tp1}\n"
-                        f"TP2: {tp2}\n"
-                        f"TP3: {tp3}\n"
-                        f"EMA200: {ema200}\n"
-                        f"HTF: {data['htf']}\n"
-                        f"Spread: {round(data['spread_rel'], 5)}\n"
-                        f"ATR: {round(atr, 2)}\n"
-                        f"ATR%: {round(data['atr_perc'], 5)}\n"
-                        f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
-                        f"BodyRatio: {round(data['body_ratio'], 2)}\n"
-                        f"Tamaño posición: {round(position_size, 6)}\n"
-                        f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
-                        f"Balance: {round(sim_balance, 2)} €"
-                    )
+                    if not trade_valido(precio, atr, position_size):
+                        print("Trade BUY descartado por comisiones", flush=True)
+                        trade_descartado = True
+                    else:
+                        entry_fee_est = precio * position_size * TAKER_FEE_RATE
+
+                        mensaje = (
+                            f"🟢 BRAVUS BOT PRO - BUY\n"
+                            f"Par: {PAIR}\n"
+                            f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"Precio: {precio}\n"
+                            f"SL inicial: {sl_inicial}\n"
+                            f"TP1: {tp1}\n"
+                            f"TP2: {tp2}\n"
+                            f"TP3: {tp3}\n"
+                            f"EMA200: {ema200}\n"
+                            f"HTF: {data['htf']}\n"
+                            f"Spread: {round(data['spread_rel'], 5)}\n"
+                            f"ATR: {round(atr, 2)}\n"
+                            f"ATR%: {round(data['atr_perc'], 5)}\n"
+                            f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
+                            f"BodyRatio: {round(data['body_ratio'], 2)}\n"
+                            f"Tamaño posición: {round(position_size, 6)}\n"
+                            f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
+                            f"Balance: {round(sim_balance, 2)} €"
+                        )
 
                 elif data["short"]:
                     senal = "sell"
 
                     sl_inicial = round(precio + atr * SL_ATR_MULT, 2)
-                    tp1 = round(precio - atr * 1.0, 2)
-                    tp2 = round(precio - atr * 2.0, 2)
-                    tp3 = round(precio - atr * 3.0, 2)
+                    tp1 = round(precio - atr * TP1_ATR_MULT, 2)
+                    tp2 = round(precio - atr * TP2_ATR_MULT, 2)
+                    tp3 = round(precio - atr * TP3_ATR_MULT, 2)
                     position_size = calcular_position_size(precio, sl_inicial)
-                    entry_fee_est = precio * position_size * TAKER_FEE_RATE
 
-                    mensaje = (
-                        f"🔴 BRAVUS BOT PRO - SELL\n"
-                        f"Par: {PAIR}\n"
-                        f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"Precio: {precio}\n"
-                        f"SL inicial: {sl_inicial}\n"
-                        f"TP1: {tp1}\n"
-                        f"TP2: {tp2}\n"
-                        f"TP3: {tp3}\n"
-                        f"EMA200: {ema200}\n"
-                        f"HTF: {data['htf']}\n"
-                        f"Spread: {round(data['spread_rel'], 5)}\n"
-                        f"ATR: {round(atr, 2)}\n"
-                        f"ATR%: {round(data['atr_perc'], 5)}\n"
-                        f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
-                        f"BodyRatio: {round(data['body_ratio'], 2)}\n"
-                        f"Tamaño posición: {round(position_size, 6)}\n"
-                        f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
-                        f"Balance: {round(sim_balance, 2)} €"
-                    )
+                    if not trade_valido(precio, atr, position_size):
+                        print("Trade SELL descartado por comisiones", flush=True)
+                        trade_descartado = True
+                    else:
+                        entry_fee_est = precio * position_size * TAKER_FEE_RATE
+
+                        mensaje = (
+                            f"🔴 BRAVUS BOT PRO - SELL\n"
+                            f"Par: {PAIR}\n"
+                            f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"Precio: {precio}\n"
+                            f"SL inicial: {sl_inicial}\n"
+                            f"TP1: {tp1}\n"
+                            f"TP2: {tp2}\n"
+                            f"TP3: {tp3}\n"
+                            f"EMA200: {ema200}\n"
+                            f"HTF: {data['htf']}\n"
+                            f"Spread: {round(data['spread_rel'], 5)}\n"
+                            f"ATR: {round(atr, 2)}\n"
+                            f"ATR%: {round(data['atr_perc'], 5)}\n"
+                            f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
+                            f"BodyRatio: {round(data['body_ratio'], 2)}\n"
+                            f"Tamaño posición: {round(position_size, 6)}\n"
+                            f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
+                            f"Balance: {round(sim_balance, 2)} €"
+                        )
                 else:
                     senal = "neutral"
                     mensaje = None
@@ -984,7 +1003,7 @@ def main():
                     (ahora - ultimo_envio).total_seconds() > MINUTES_BETWEEN_SIGNALS * 60
                 )
 
-                if mensaje and senal != ultima_senal and puede_enviar:
+                if not trade_descartado and mensaje and senal != ultima_senal and puede_enviar:
                     trade_opened = abrir_trade(senal, precio, atr)
                     if trade_opened:
                         enviar_mensaje(mensaje)
