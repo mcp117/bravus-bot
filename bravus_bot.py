@@ -33,11 +33,11 @@ LEN_EMA6 = 60
 LEN_EMA_TREND = 200
 
 # Filtros
-MIN_SPREAD_PERC = 0.0012
+MIN_SPREAD_PERC = 0.001
 BARS_FOR_TREND_HOLD = 4
 ATR_LENGTH = 14
 ATR_MIN_MULT = 0.8
-MIN_BODY_RATIO = 0.8
+MIN_BODY_RATIO = 0.65
 
 USE_SLOPE_FILTER = True
 USE_SPREAD_FILTER = True
@@ -66,9 +66,9 @@ MAX_DAILY_LOSS_PERC = 0.03  # 3% pérdida diaria máxima
 TAKER_FEE_RATE = 0.0005     # 0.05% por lado
 
 # Filtros extra de eficiencia
-MIN_ATR_PERC = 0.0007
-COOLDOWN_TRADES = 10
-MAX_DISTANCE_EMA200 = 0.01
+MIN_ATR_PERC = 0.0005
+COOLDOWN_TRADES = 5
+MAX_DISTANCE_EMA200 = 0.015
 
 # ==============================
 # ESTADO GLOBAL
@@ -301,9 +301,7 @@ def calcular_atr(candles, period=14):
     return sum(tr[-period:]) / period
 
 def trade_valido(entry, atr, position_size):
-    # Movimiento estimado útil mínimo
     movimiento_estimado = atr * position_size * 2
-    # Fee aproximada ida y vuelta
     fee_total = entry * position_size * TAKER_FEE_RATE * 2
     return movimiento_estimado > fee_total * 1.5
 
