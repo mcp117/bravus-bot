@@ -47,7 +47,7 @@ USE_IMPULSE_FILTER = True
 
 # Riesgo
 SL_ATR_MULT = 1.5
-TP1_ATR_MULT = 1.5
+TP1_ATR_MULT = 2.2
 TP2_ATR_MULT = 3.0
 TP3_ATR_MULT = 5.0
 
@@ -69,6 +69,14 @@ TAKER_FEE_RATE = 0.0005     # 0.05% por lado
 MIN_ATR_PERC = 0.0005
 COOLDOWN_TRADES = 5
 MAX_DISTANCE_EMA200 = 0.015
+
+# Bloques
+BLOCK_1_PERC = 0.50
+BLOCK_2_PERC = 0.30
+BLOCK_3_PERC = 0.20
+
+# Queremos que TP1 ya deje beneficio real
+MIN_NET_PROFIT_AFTER_TP1 = 0.25  # euros netos mínimos tras cubrir fees
 
 # ==============================
 # ESTADO GLOBAL
@@ -300,10 +308,34 @@ def calcular_atr(candles, period=14):
 
     return sum(tr[-period:]) / period
 
+def calcular_pnl_bruto_simple(tipo, entry_price, exit_price, quantity):
+    if tipo == "buy":
+        return (exit_price - entry_price) * quantity
+    return (entry_price - exit_price) * quantity
+
 def trade_valido(entry, atr, position_size):
     movimiento_estimado = atr * position_size * 2
     fee_total = entry * position_size * TAKER_FEE_RATE * 2
     return movimiento_estimado > fee_total * 1.5
+
+def tp1_cubre_comisiones_y_gana(tipo, entry, atr, position_size):
+    if position_size <= 0:
+        return False
+
+    block1_qty = position_size * BLOCK_1_PERC
+    entry_fee_total = entry * position_size * TAKER_FEE_RATE
+
+    if tipo == "buy":
+        tp1 = entry + atr * TP1_ATR_MULT
+    else:
+        tp1 = entry - atr * TP1_ATR_MULT
+
+    gross_pnl_tp1 = calcular_pnl_bruto_simple(tipo, entry, tp1, block1_qty)
+    exit_fee_tp1 = tp1 * block1_qty * TAKER_FEE_RATE
+
+    net_after_tp1 = gross_pnl_tp1 - entry_fee_total - exit_fee_tp1
+
+    return net_after_tp1 >= MIN_NET_PROFIT_AFTER_TP1
 
 # ==============================
 # ANÁLISIS
@@ -565,7 +597,16 @@ def abrir_trade(tipo, entry, atr):
     if position_size <= 0:
         return False
 
-    block_size = position_size / 3.0
+    if not trade_valido(entry, atr, position_size):
+        return False
+
+    if not tp1_cubre_comisiones_y_gana(tipo, entry, atr, position_size):
+        return False
+
+    block1_size = position_size * BLOCK_1_PERC
+    block2_size = position_size * BLOCK_2_PERC
+    block3_size = position_size * BLOCK_3_PERC
+
     entry_fee = aplicar_fee_entrada(entry, position_size)
 
     open_trade = {
@@ -583,7 +624,9 @@ def abrir_trade(tipo, entry, atr):
         "tp2_hit": False,
         "tp3_hit": False,
         "position_size": position_size,
-        "block_size": block_size,
+        "block1_size": block1_size,
+        "block2_size": block2_size,
+        "block3_size": block3_size,
         "qty_remaining": position_size,
         "entry_fee_paid": entry_fee,
         "fees_paid": entry_fee,
@@ -604,7 +647,9 @@ def gestionar_trade(precio_actual):
     tp1 = open_trade["tp1"]
     tp2 = open_trade["tp2"]
     tp3 = open_trade["tp3"]
-    block_size = open_trade["block_size"]
+
+    block1_size = open_trade["block1_size"]
+    block2_size = open_trade["block2_size"]
 
     if tipo == "buy":
 
@@ -613,13 +658,13 @@ def gestionar_trade(precio_actual):
             open_trade["bloques_restantes"] = 2
             open_trade["sl_actual"] = tp1
 
-            _, fee, net = cerrar_cantidad(tp1, block_size)
+            _, fee, net = cerrar_cantidad(tp1, block1_size)
 
             return {
                 "mensaje": (
                     f"✅ TP1 alcanzado en BUY\n"
                     f"Precio de salida: {tp1}\n"
-                    f"Bloque 1 cerrado\n"
+                    f"Bloque 1 cerrado (50%)\n"
                     f"Nuevo SL: {open_trade['sl_actual']}\n"
                     f"PnL neto bloque: {round(net, 2)} €\n"
                     f"Fee salida: {round(fee, 2)} €\n"
@@ -633,13 +678,13 @@ def gestionar_trade(precio_actual):
             open_trade["bloques_restantes"] = 1
             open_trade["sl_actual"] = tp2
 
-            _, fee, net = cerrar_cantidad(tp2, block_size)
+            _, fee, net = cerrar_cantidad(tp2, block2_size)
 
             return {
                 "mensaje": (
                     f"✅ TP2 alcanzado en BUY\n"
                     f"Precio de salida: {tp2}\n"
-                    f"Bloque 2 cerrado\n"
+                    f"Bloque 2 cerrado (30%)\n"
                     f"Nuevo SL: {open_trade['sl_actual']}\n"
                     f"PnL neto bloque: {round(net, 2)} €\n"
                     f"Fee salida: {round(fee, 2)} €\n"
@@ -659,7 +704,7 @@ def gestionar_trade(precio_actual):
                 "mensaje": (
                     f"🚀 TP3 alcanzado en BUY\n"
                     f"Precio de salida: {tp3}\n"
-                    f"Bloque 3 cerrado\n"
+                    f"Bloque 3 cerrado (20%)\n"
                     f"PnL neto bloque: {round(net, 2)} €\n"
                     f"Fee salida: {round(fee, 2)} €\n"
                     f"Trade terminado"
@@ -722,13 +767,13 @@ def gestionar_trade(precio_actual):
             open_trade["bloques_restantes"] = 2
             open_trade["sl_actual"] = tp1
 
-            _, fee, net = cerrar_cantidad(tp1, block_size)
+            _, fee, net = cerrar_cantidad(tp1, block1_size)
 
             return {
                 "mensaje": (
                     f"✅ TP1 alcanzado en SELL\n"
                     f"Precio de salida: {tp1}\n"
-                    f"Bloque 1 cerrado\n"
+                    f"Bloque 1 cerrado (50%)\n"
                     f"Nuevo SL: {open_trade['sl_actual']}\n"
                     f"PnL neto bloque: {round(net, 2)} €\n"
                     f"Fee salida: {round(fee, 2)} €\n"
@@ -742,13 +787,13 @@ def gestionar_trade(precio_actual):
             open_trade["bloques_restantes"] = 1
             open_trade["sl_actual"] = tp2
 
-            _, fee, net = cerrar_cantidad(tp2, block_size)
+            _, fee, net = cerrar_cantidad(tp2, block2_size)
 
             return {
                 "mensaje": (
                     f"✅ TP2 alcanzado en SELL\n"
                     f"Precio de salida: {tp2}\n"
-                    f"Bloque 2 cerrado\n"
+                    f"Bloque 2 cerrado (30%)\n"
                     f"Nuevo SL: {open_trade['sl_actual']}\n"
                     f"PnL neto bloque: {round(net, 2)} €\n"
                     f"Fee salida: {round(fee, 2)} €\n"
@@ -768,7 +813,7 @@ def gestionar_trade(precio_actual):
                 "mensaje": (
                     f"🚀 TP3 alcanzado en SELL\n"
                     f"Precio de salida: {tp3}\n"
-                    f"Bloque 3 cerrado\n"
+                    f"Bloque 3 cerrado (20%)\n"
                     f"PnL neto bloque: {round(net, 2)} €\n"
                     f"Fee salida: {round(fee, 2)} €\n"
                     f"Trade terminado"
@@ -933,6 +978,9 @@ def main():
                     if not trade_valido(precio, atr, position_size):
                         print("Trade BUY descartado por comisiones", flush=True)
                         trade_descartado = True
+                    elif not tp1_cubre_comisiones_y_gana("buy", precio, atr, position_size):
+                        print("Trade BUY descartado: TP1 no cubre fees con beneficio", flush=True)
+                        trade_descartado = True
                     else:
                         entry_fee_est = precio * position_size * TAKER_FEE_RATE
 
@@ -968,6 +1016,9 @@ def main():
 
                     if not trade_valido(precio, atr, position_size):
                         print("Trade SELL descartado por comisiones", flush=True)
+                        trade_descartado = True
+                    elif not tp1_cubre_comisiones_y_gana("sell", precio, atr, position_size):
+                        print("Trade SELL descartado: TP1 no cubre fees con beneficio", flush=True)
                         trade_descartado = True
                     else:
                         entry_fee_est = precio * position_size * TAKER_FEE_RATE
