@@ -30,14 +30,14 @@ READ_BALANCE_ON_START = True
 # ==============================
 # SEGURIDAD / MODO REAL
 # ==============================
-LIVE_TRADING = False           # Cambiar a True solo cuando quieras operar real
-REAL_ORDER_USD_SIZE = 25.0     # Tamaño fijo en USD para orden spot real
-REAL_TRADING_SPOT_ONLY_LONG = True  # En spot real solo compra (no vende en corto)
+LIVE_TRADING = False                  # True solo cuando quieras operar real
+REAL_ORDER_USD_SIZE = 25.0
+REAL_TRADING_SPOT_ONLY_LONG = True    # En spot real no se permite short real
 
 # ==============================
 # MERCADO
 # ==============================
-PAIR = "XBTUSD"                # Kraken spot BTC/USD
+PAIR = "XBTUSD"
 INTERVAL = 1
 HTF_INTERVAL = 5
 DAILY_INTERVAL = 1440
@@ -53,11 +53,11 @@ LEN_EMA5 = 50
 LEN_EMA6 = 60
 LEN_EMA_TREND = 200
 
-MIN_SPREAD_PERC = 0.0009
-BARS_FOR_TREND_HOLD = 3
+MIN_SPREAD_PERC = 0.0008
+BARS_FOR_TREND_HOLD = 2
 ATR_LENGTH = 14
 ATR_MIN_MULT = 0.8
-MIN_BODY_RATIO = 0.60
+MIN_BODY_RATIO = 0.55
 
 USE_SLOPE_FILTER = True
 USE_SPREAD_FILTER = True
@@ -74,7 +74,7 @@ TP2_ATR_MULT = 3.2
 TP3_ATR_MULT = 5.0
 
 CHECK_EVERY_SECONDS = 60
-MINUTES_BETWEEN_SIGNALS = 20
+MINUTES_BETWEEN_SIGNALS = 10
 
 TRADES_FILE = "trades.csv"
 BALANCE_FILE = "balance_log.csv"
@@ -87,9 +87,9 @@ RISK_PER_TRADE = 0.003
 MAX_DAILY_LOSS_PERC = 0.03
 TAKER_FEE_RATE = 0.0005
 
-MIN_ATR_PERC = 0.00045
-MAX_DISTANCE_EMA200 = 0.02
-COOLDOWN_SECONDS = 300
+MIN_ATR_PERC = 0.00035
+MAX_DISTANCE_EMA200 = 0.025
+COOLDOWN_SECONDS = 180
 
 BLOCK_1_PERC = 0.50
 BLOCK_2_PERC = 0.30
@@ -98,23 +98,21 @@ BLOCK_3_PERC = 0.20
 MIN_NET_PROFIT_AFTER_TP1 = 0.25
 
 # ==============================
-# FILTROS EXTRA BASADOS EN TUS DATOS
+# FILTROS BASADOS EN TUS DATOS
 # ==============================
-# Horas UTC con mejor comportamiento histórico en tus CSV de BTC
-# (derivado principalmente del 1h)
-ALLOWED_UTC_HOURS = {4, 5, 6, 7, 8, 9, 17, 18, 19, 20}
+# Los dejo opcionales para que el bot no se quede parado.
+USE_DATA_TIME_FILTER = False
+USE_DAILY_MACRO_FILTER = False
+USE_DAILY_VOL_FILTER = False
 
-# Días con mejor comportamiento medio en tus datos
-# 0=Lunes, 1=Martes, 2=Miércoles, 3=Jueves, 4=Viernes, 5=Sábado, 6=Domingo
+ALLOWED_UTC_HOURS = {4, 5, 6, 7, 8, 9, 17, 18, 19, 20}
 ALLOWED_WEEKDAYS = {0, 1, 2, 4}
 
-# Filtro macro diario derivado de la lectura de tus datos
-USE_DAILY_MACRO_FILTER = True
-USE_DAILY_VOL_FILTER = True
-DAILY_ATR_PERC_MIN = 0.03  # 3% ATR diario mínimo aproximado
+DAILY_ATR_PERC_MIN = 0.03
 
-# Si quieres que el bot sea más activo, ponlo en False
-ONLY_LONGS_IN_SIGNAL_ENGINE = True
+# En simulación permitimos BUY y SELL.
+# En real spot, el bloqueo short ya se controla aparte.
+ONLY_LONGS_IN_SIGNAL_ENGINE = False
 
 # ==============================
 # ESTADO GLOBAL
@@ -362,7 +360,7 @@ def obtener_ohlc(interval, retries=3):
 
             if data.get("error"):
                 errors = data["error"]
-                if any("Too many requests" in str(e) for e in errors):
+                if any("Too many requests" in str(e) or "Demasiadas solicitudes" in str(e) for e in errors):
                     wait_time = 2 + intento * 2
                     print(f"Rate limit Kraken, esperando {wait_time}s...", flush=True)
                     time.sleep(wait_time)
@@ -463,14 +461,28 @@ def tp1_cubre_comisiones_y_gana(tipo, entry, atr, position_size):
 # FILTROS BASADOS EN TUS DATOS
 # ==============================
 def filtro_horario_estadistico():
+    if not USE_DATA_TIME_FILTER:
+        return True
     hora_utc = datetime.utcnow().hour
     return hora_utc in ALLOWED_UTC_HOURS
 
 def filtro_dia_estadistico():
+    if not USE_DATA_TIME_FILTER:
+        return True
     dow = datetime.utcnow().weekday()
     return dow in ALLOWED_WEEKDAYS
 
 def analizar_contexto_diario():
+    if not USE_DAILY_MACRO_FILTER and not USE_DAILY_VOL_FILTER:
+        return {
+            "macro_bull": True,
+            "macro_bear": True,
+            "daily_atr_perc": 1.0,
+            "close_1d": None,
+            "ema50_1d": None,
+            "ema200_1d": None,
+        }
+
     candles_1d = obtener_ohlc(DAILY_INTERVAL)
     if len(candles_1d) < LEN_EMA_TREND + ATR_LENGTH + 5:
         return {
@@ -630,23 +642,11 @@ def analizar():
         bull_strong = bull_strong and bull_persist_ok
         bear_strong = bear_strong and bear_persist_ok
 
-    bull_prev_strong = bull_prev
-    bear_prev_strong = bear_prev
-
-    if USE_SLOPE_FILTER:
-        bull_prev_strong = bull_prev_strong and bull_slope_prev_ok
-        bear_prev_strong = bear_prev_strong and bear_slope_prev_ok
-
-    if USE_SPREAD_FILTER:
-        bull_prev_strong = bull_prev_strong and spread_prev_ok
-        bear_prev_strong = bear_prev_strong and spread_prev_ok
-
-    if USE_PERSISTENCE_FILTER:
-        bull_prev_strong = bull_prev_strong and bull_persist_ok
-        bear_prev_strong = bear_prev_strong and bear_persist_ok
-
-    new_bull = bull_strong and not bull_prev_strong
-    new_bear = bear_strong and not bear_prev_strong
+    # IMPORTANTE:
+    # antes dependía del "cruce exacto" y por eso podía pasarse días sin operar.
+    # ahora mientras la estructura siga fuerte, la señal puede seguir siendo válida.
+    new_bull = bull_strong
+    new_bear = bear_strong
 
     trend_bull = close_now > ema200_now and e1_now > ema200_now
     trend_bear = close_now < ema200_now and e1_now < ema200_now
@@ -672,13 +672,11 @@ def analizar():
 
     atr_perc = atr / close_now if atr else 0
 
-    # Contexto diario
     daily_ctx = analizar_contexto_diario()
     macro_bull_ok = (not USE_DAILY_MACRO_FILTER) or daily_ctx["macro_bull"]
     macro_bear_ok = (not USE_DAILY_MACRO_FILTER) or daily_ctx["macro_bear"]
     daily_vol_ok = (not USE_DAILY_VOL_FILTER) or (daily_ctx["daily_atr_perc"] >= DAILY_ATR_PERC_MIN)
 
-    # Filtros de tus datos
     horario_ok = filtro_horario_estadistico()
     dia_ok = filtro_dia_estadistico()
 
@@ -718,9 +716,6 @@ def analizar():
         "macro_bear_ok": macro_bear_ok,
         "daily_vol_ok": daily_vol_ok,
         "daily_atr_perc": daily_ctx["daily_atr_perc"],
-        "close_1d": daily_ctx["close_1d"],
-        "ema50_1d": daily_ctx["ema50_1d"],
-        "ema200_1d": daily_ctx["ema200_1d"],
     }
 
 # ==============================
@@ -1115,8 +1110,9 @@ def main():
         f"Balance inicial simulado: {round(sim_balance, 2)} €\n"
         f"Riesgo por trade: {round(RISK_PER_TRADE * 100, 2)}%\n"
         f"Comisión simulada por lado: {round(TAKER_FEE_RATE * 100, 4)}%\n"
-        f"Filtro horario UTC: {sorted(ALLOWED_UTC_HOURS)}\n"
-        f"Filtro días: {sorted(ALLOWED_WEEKDAYS)}"
+        f"Filtro datos horario activo: {'SÍ' if USE_DATA_TIME_FILTER else 'NO'}\n"
+        f"Filtro macro diario activo: {'SÍ' if USE_DAILY_MACRO_FILTER else 'NO'}\n"
+        f"Filtro volatilidad diaria activo: {'SÍ' if USE_DAILY_VOL_FILTER else 'NO'}"
     )
 
     while True:
@@ -1259,9 +1255,14 @@ def main():
                         if LIVE_TRADING:
                             try:
                                 if REAL_TRADING_SPOT_ONLY_LONG and senal == "sell":
-                                    enviar_mensaje("⚠️ Señal SELL detectada, pero no se envía orden real porque el modo real está en spot solo BUY.")
+                                    enviar_mensaje(
+                                        "⚠️ Señal SELL detectada, pero no se envía orden real "
+                                        "porque el modo real está en spot solo BUY."
+                                    )
                                 else:
-                                    real_result = kraken_add_spot_market_order_by_usd(PAIR, senal, REAL_ORDER_USD_SIZE, precio)
+                                    real_result = kraken_add_spot_market_order_by_usd(
+                                        PAIR, senal, REAL_ORDER_USD_SIZE, precio
+                                    )
                                     enviar_mensaje(f"✅ ORDEN REAL ENVIADA A KRAKEN\nResultado: {real_result}")
                             except Exception as e:
                                 enviar_mensaje(f"❌ Error enviando orden real a Kraken: {e}")
