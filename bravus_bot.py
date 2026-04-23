@@ -5,7 +5,7 @@ import hmac
 import base64
 import hashlib
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 from dotenv import load_dotenv
@@ -53,11 +53,12 @@ LEN_EMA5 = 50
 LEN_EMA6 = 60
 LEN_EMA_TREND = 200
 
-MIN_SPREAD_PERC = 0.0008
-BARS_FOR_TREND_HOLD = 2
+# Más estricto que antes
+MIN_SPREAD_PERC = 0.0011
+BARS_FOR_TREND_HOLD = 4
 ATR_LENGTH = 14
 ATR_MIN_MULT = 0.8
-MIN_BODY_RATIO = 0.55
+MIN_BODY_RATIO = 0.70
 
 USE_SLOPE_FILTER = True
 USE_SPREAD_FILTER = True
@@ -68,13 +69,13 @@ USE_IMPULSE_FILTER = True
 # ==============================
 # RIESGO / OBJETIVOS
 # ==============================
-SL_ATR_MULT = 1.5
-TP1_ATR_MULT = 2.2
-TP2_ATR_MULT = 3.2
-TP3_ATR_MULT = 5.0
+SL_ATR_MULT = 1.6
+TP1_ATR_MULT = 2.8
+TP2_ATR_MULT = 4.2
+TP3_ATR_MULT = 6.2
 
 CHECK_EVERY_SECONDS = 60
-MINUTES_BETWEEN_SIGNALS = 10
+MINUTES_BETWEEN_SIGNALS = 20
 
 TRADES_FILE = "trades.csv"
 BALANCE_FILE = "balance_log.csv"
@@ -83,26 +84,45 @@ BALANCE_FILE = "balance_log.csv"
 # SIMULACIÓN
 # ==============================
 INITIAL_BALANCE = 1000.0
-RISK_PER_TRADE = 0.003
+RISK_PER_TRADE = 0.0025               # 0.25%
 MAX_DAILY_LOSS_PERC = 0.03
-TAKER_FEE_RATE = 0.0005
 
-MIN_ATR_PERC = 0.00035
-MAX_DISTANCE_EMA200 = 0.025
-COOLDOWN_SECONDS = 180
+# Kraken spot market -> taker realista base
+# maker base spot estándar: 0.23%
+# taker base spot estándar: 0.40%
+# usamos taker en entrada y salida para ser conservadores
+MAKER_FEE_RATE = 0.0023
+TAKER_FEE_RATE = 0.0040
+
+MIN_ATR_PERC = 0.00085
+MIN_DISTANCE_EMA200 = 0.0030
+MAX_DISTANCE_EMA200 = 0.0120
+
+COOLDOWN_SECONDS = 600
+BLOCK_SAME_SIDE_AFTER_INITIAL_SL_SECONDS = 2700  # 45 min tras SL inicial
 
 BLOCK_1_PERC = 0.50
 BLOCK_2_PERC = 0.30
 BLOCK_3_PERC = 0.20
 
-MIN_NET_PROFIT_AFTER_TP1 = 0.25
+# Para que el trade tenga sentido neto tras fees reales
+MIN_LOCKED_NET_AFTER_TP1 = 1.00
+MIN_FULL_NET_PROFIT = 2.00
+MIN_FULL_NET_RR = 1.15
+
+# Límites de realismo spot / control de costes
+MAX_NOTIONAL_BALANCE_PERC = 0.95      # no usar más del 95% del balance como nominal
+MAX_FEE_TO_RISK_RATIO = 0.60          # roundtrip fees <= 60% del riesgo del trade
+
+# Control de rachas malas
+MAX_INITIAL_SL_PER_SIDE = 2
+MAX_INITIAL_SL_TOTAL_PER_DAY = 3
 
 # ==============================
-# FILTROS BASADOS EN TUS DATOS
+# FILTROS OPCIONALES BASADOS EN DATOS
 # ==============================
-# Los dejo opcionales para que el bot no se quede parado.
 USE_DATA_TIME_FILTER = False
-USE_DAILY_MACRO_FILTER = False
+USE_DAILY_MACRO_FILTER = True
 USE_DAILY_VOL_FILTER = False
 
 ALLOWED_UTC_HOURS = {4, 5, 6, 7, 8, 9, 17, 18, 19, 20}
@@ -110,9 +130,12 @@ ALLOWED_WEEKDAYS = {0, 1, 2, 4}
 
 DAILY_ATR_PERC_MIN = 0.03
 
-# En simulación permitimos BUY y SELL.
-# En real spot, el bloqueo short ya se controla aparte.
+# En simulación dejamos BUY y SELL.
+# Si más adelante quieres solo largos, ponlo en True.
 ONLY_LONGS_IN_SIGNAL_ENGINE = False
+
+# Si quieres muy pocas entradas y muy limpias, déjalo en True
+REQUIRE_FRESH_SETUP = True
 
 # ==============================
 # ESTADO GLOBAL
@@ -128,6 +151,10 @@ day_start_balance = INITIAL_BALANCE
 daily_loss_amount = 0.0
 
 last_trade_close_time = None
+
+side_blocked_until = {"buy": None, "sell": None}
+initial_sl_side_count = {"buy": 0, "sell": 0}
+initial_sl_total_today = 0
 
 # ==============================
 # TELEGRAM
@@ -155,7 +182,7 @@ def kraken_sign(urlpath: str, data: dict, secret: str) -> str:
     sigdigest = base64.b64encode(mac.digest())
     return sigdigest.decode()
 
-def kraken_private_request(endpoint: str, data: dict | None = None):
+def kraken_private_request(endpoint: str, data=None):
     if not USE_KRAKEN_PRIVATE:
         raise ValueError("API privada de Kraken no configurada")
 
@@ -290,18 +317,25 @@ def enviar_resumen_diario():
         f"Trades: {metricas['trades']}\n"
         f"Winrate: {metricas['winrate']}%\n"
         f"Profit Factor: {metricas['profit_factor']}\n"
-        f"Drawdown max: {round(max_drawdown_perc, 2)}%"
+        f"Drawdown max: {round(max_drawdown_perc, 2)}%\n"
+        f"SL iniciales hoy: {initial_sl_total_today}\n"
+        f"SL BUY hoy: {initial_sl_side_count['buy']} | SL SELL hoy: {initial_sl_side_count['sell']}"
     )
     enviar_mensaje(mensaje)
 
 def reset_daily_loss_if_new_day():
     global current_day, day_start_balance, daily_loss_amount
+    global initial_sl_total_today, initial_sl_side_count, side_blocked_until
+
     hoy = datetime.now().date()
     if hoy != current_day:
         enviar_resumen_diario()
         current_day = hoy
         day_start_balance = sim_balance
         daily_loss_amount = 0.0
+        initial_sl_total_today = 0
+        initial_sl_side_count = {"buy": 0, "sell": 0}
+        side_blocked_until = {"buy": None, "sell": None}
 
 def puede_operar_por_perdida_diaria():
     limite = day_start_balance * MAX_DAILY_LOSS_PERC
@@ -320,12 +354,6 @@ def actualizar_drawdown():
 
 def calcular_risk_amount():
     return sim_balance * RISK_PER_TRADE
-
-def calcular_position_size(entry, sl):
-    risk_per_unit = abs(entry - sl)
-    if risk_per_unit <= 0:
-        return 0.0
-    return calcular_risk_amount() / risk_per_unit
 
 def aplicar_balance_change(amount):
     global sim_balance, daily_loss_amount
@@ -346,6 +374,40 @@ def segundos_cooldown_restantes():
         return 0
     elapsed = (datetime.now() - last_trade_close_time).total_seconds()
     return max(0, int(COOLDOWN_SECONDS - elapsed))
+
+def side_temporalmente_bloqueado(side: str):
+    until = side_blocked_until.get(side)
+    if until is None:
+        return False
+    return datetime.now() < until
+
+def puede_abrir_side(side: str):
+    if initial_sl_total_today >= MAX_INITIAL_SL_TOTAL_PER_DAY:
+        return False, "máximo de SL iniciales del día alcanzado"
+
+    if initial_sl_side_count[side] >= MAX_INITIAL_SL_PER_SIDE:
+        return False, f"máximo de SL iniciales en {side} alcanzado hoy"
+
+    if side_temporalmente_bloqueado(side):
+        restante = int((side_blocked_until[side] - datetime.now()).total_seconds() / 60)
+        return False, f"{side} bloqueado temporalmente {max(1, restante)} min"
+
+    return True, "ok"
+
+def registrar_cierre_total(side: str, resultado: str):
+    global last_trade_close_time, initial_sl_total_today, initial_sl_side_count
+
+    last_trade_close_time = datetime.now()
+
+    if resultado == "SL":
+        initial_sl_total_today += 1
+        initial_sl_side_count[side] += 1
+        side_blocked_until[side] = datetime.now() + timedelta(
+            seconds=BLOCK_SAME_SIDE_AFTER_INITIAL_SL_SECONDS
+        )
+    else:
+        # Un trade gestionado en beneficio resetea la racha de SL de ese lado
+        initial_sl_side_count[side] = 0
 
 # ==============================
 # DATOS
@@ -412,6 +474,7 @@ def barras_desde_false(lista_booleana):
 
 def calcular_atr(candles, period=14):
     tr = []
+
     for i in range(1, len(candles)):
         high = float(candles[i][2])
         low = float(candles[i][3])
@@ -429,36 +492,8 @@ def calcular_atr(candles, period=14):
 
     return sum(tr[-period:]) / period
 
-def calcular_pnl_bruto_simple(tipo, entry_price, exit_price, quantity):
-    if tipo == "buy":
-        return (exit_price - entry_price) * quantity
-    return (entry_price - exit_price) * quantity
-
-def trade_valido(entry, atr, position_size):
-    movimiento_estimado = atr * position_size * 2
-    fee_total = entry * position_size * TAKER_FEE_RATE * 2
-    return movimiento_estimado > fee_total * 1.5
-
-def tp1_cubre_comisiones_y_gana(tipo, entry, atr, position_size):
-    if position_size <= 0:
-        return False
-
-    block1_qty = position_size * BLOCK_1_PERC
-    entry_fee_total = entry * position_size * TAKER_FEE_RATE
-
-    if tipo == "buy":
-        tp1 = entry + atr * TP1_ATR_MULT
-    else:
-        tp1 = entry - atr * TP1_ATR_MULT
-
-    gross_pnl_tp1 = calcular_pnl_bruto_simple(tipo, entry, tp1, block1_qty)
-    exit_fee_tp1 = tp1 * block1_qty * TAKER_FEE_RATE
-    net_after_tp1 = gross_pnl_tp1 - entry_fee_total - exit_fee_tp1
-
-    return net_after_tp1 >= MIN_NET_PROFIT_AFTER_TP1
-
 # ==============================
-# FILTROS BASADOS EN TUS DATOS
+# FILTROS BASADOS EN DATOS
 # ==============================
 def filtro_horario_estadistico():
     if not USE_DATA_TIME_FILTER:
@@ -477,7 +512,7 @@ def analizar_contexto_diario():
         return {
             "macro_bull": True,
             "macro_bear": True,
-            "daily_atr_perc": 1.0,
+            "daily_atr_perc": None,
             "close_1d": None,
             "ema50_1d": None,
             "ema200_1d": None,
@@ -495,6 +530,7 @@ def analizar_contexto_diario():
         }
 
     closes_1d = [float(c[4]) for c in candles_1d]
+
     ema50_1d_series = calcular_serie_ema(closes_1d, 50)
     ema200_1d_series = calcular_serie_ema(closes_1d, 200)
 
@@ -507,6 +543,7 @@ def analizar_contexto_diario():
 
     macro_bull = False
     macro_bear = False
+
     if ema50_1d is not None and ema200_1d is not None:
         macro_bull = close_1d > ema200_1d and ema50_1d > ema200_1d
         macro_bear = close_1d < ema200_1d and ema50_1d < ema200_1d
@@ -519,6 +556,143 @@ def analizar_contexto_diario():
         "ema50_1d": ema50_1d,
         "ema200_1d": ema200_1d,
     }
+
+# ==============================
+# EXPECTATIVA / FEES / TAMAÑO
+# ==============================
+def calcular_pnl_bruto_simple(tipo, entry_price, exit_price, quantity):
+    if tipo == "buy":
+        return (exit_price - entry_price) * quantity
+    return (entry_price - exit_price) * quantity
+
+def calcular_position_size_por_riesgo(entry, sl):
+    risk_per_unit = abs(entry - sl)
+    if risk_per_unit <= 0:
+        return 0.0
+    return calcular_risk_amount() / risk_per_unit
+
+def max_position_size_por_balance(entry):
+    if entry <= 0:
+        return 0.0
+    max_notional = sim_balance * MAX_NOTIONAL_BALANCE_PERC
+    return max_notional / entry
+
+def max_position_size_por_fee_budget(entry):
+    if entry <= 0:
+        return 0.0
+
+    # Presupuesto máximo de comisiones roundtrip
+    max_fee_budget = calcular_risk_amount() * MAX_FEE_TO_RISK_RATIO
+    fee_per_unit_roundtrip = entry * TAKER_FEE_RATE * 2
+
+    if fee_per_unit_roundtrip <= 0:
+        return 0.0
+
+    return max_fee_budget / fee_per_unit_roundtrip
+
+def ajustar_position_size(entry, raw_position_size):
+    by_balance = max_position_size_por_balance(entry)
+    by_fee = max_position_size_por_fee_budget(entry)
+    return min(raw_position_size, by_balance, by_fee)
+
+def trade_valido(entry, atr, position_size):
+    if position_size <= 0:
+        return False
+
+    movimiento_estimado = atr * position_size * 2
+    fee_total_estimado = entry * position_size * TAKER_FEE_RATE * 2
+    return movimiento_estimado > fee_total_estimado * 1.25
+
+def construir_niveles(tipo, entry, atr):
+    if tipo == "buy":
+        sl = round(entry - atr * SL_ATR_MULT, 2)
+        tp1 = round(entry + atr * TP1_ATR_MULT, 2)
+        tp2 = round(entry + atr * TP2_ATR_MULT, 2)
+        tp3 = round(entry + atr * TP3_ATR_MULT, 2)
+    else:
+        sl = round(entry + atr * SL_ATR_MULT, 2)
+        tp1 = round(entry - atr * TP1_ATR_MULT, 2)
+        tp2 = round(entry - atr * TP2_ATR_MULT, 2)
+        tp3 = round(entry - atr * TP3_ATR_MULT, 2)
+
+    return sl, tp1, tp2, tp3
+
+def perfil_esperado_trade(tipo, entry, atr, position_size):
+    sl, tp1, tp2, tp3 = construir_niveles(tipo, entry, atr)
+
+    b1 = position_size * BLOCK_1_PERC
+    b2 = position_size * BLOCK_2_PERC
+    b3 = position_size * BLOCK_3_PERC
+
+    entry_fee_total = entry * position_size * TAKER_FEE_RATE
+
+    # Pérdida si salta SL inicial en todo
+    gross_sl = calcular_pnl_bruto_simple(tipo, entry, sl, position_size)
+    exit_fee_sl = sl * position_size * TAKER_FEE_RATE
+    net_sl = gross_sl - entry_fee_total - exit_fee_sl
+
+    # Beneficio mínimo bloqueado si toca TP1 y luego vuelve a TP1
+    gross_after_tp1 = (
+        calcular_pnl_bruto_simple(tipo, entry, tp1, b1) +
+        calcular_pnl_bruto_simple(tipo, entry, tp1, b2) +
+        calcular_pnl_bruto_simple(tipo, entry, tp1, b3)
+    )
+    exit_fee_after_tp1 = tp1 * (b1 + b2 + b3) * TAKER_FEE_RATE
+    net_after_tp1 = gross_after_tp1 - entry_fee_total - exit_fee_after_tp1
+
+    # Beneficio si toca TP2 y luego vuelve a TP2
+    gross_after_tp2 = (
+        calcular_pnl_bruto_simple(tipo, entry, tp1, b1) +
+        calcular_pnl_bruto_simple(tipo, entry, tp2, b2) +
+        calcular_pnl_bruto_simple(tipo, entry, tp2, b3)
+    )
+    exit_fee_after_tp2 = (
+        tp1 * b1 * TAKER_FEE_RATE +
+        tp2 * b2 * TAKER_FEE_RATE +
+        tp2 * b3 * TAKER_FEE_RATE
+    )
+    net_after_tp2 = gross_after_tp2 - entry_fee_total - exit_fee_after_tp2
+
+    # Beneficio completo
+    gross_full = (
+        calcular_pnl_bruto_simple(tipo, entry, tp1, b1) +
+        calcular_pnl_bruto_simple(tipo, entry, tp2, b2) +
+        calcular_pnl_bruto_simple(tipo, entry, tp3, b3)
+    )
+    exit_fee_full = (
+        tp1 * b1 * TAKER_FEE_RATE +
+        tp2 * b2 * TAKER_FEE_RATE +
+        tp3 * b3 * TAKER_FEE_RATE
+    )
+    net_full = gross_full - entry_fee_total - exit_fee_full
+
+    initial_loss_abs = abs(net_sl)
+    full_rr = (net_full / initial_loss_abs) if initial_loss_abs > 0 else 0.0
+
+    return {
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "net_sl": net_sl,
+        "net_after_tp1": net_after_tp1,
+        "net_after_tp2": net_after_tp2,
+        "net_full": net_full,
+        "full_rr": full_rr,
+        "entry_fee_total": entry_fee_total,
+    }
+
+def expectativa_suficiente(tipo, entry, atr, position_size):
+    if position_size <= 0:
+        return False
+
+    perfil = perfil_esperado_trade(tipo, entry, atr, position_size)
+
+    return (
+        perfil["net_after_tp1"] >= MIN_LOCKED_NET_AFTER_TP1
+        and perfil["net_full"] >= MIN_FULL_NET_PROFIT
+        and perfil["full_rr"] >= MIN_FULL_NET_RR
+    )
 
 # ==============================
 # ANÁLISIS INTRADÍA
@@ -642,11 +816,27 @@ def analizar():
         bull_strong = bull_strong and bull_persist_ok
         bear_strong = bear_strong and bear_persist_ok
 
-    # IMPORTANTE:
-    # antes dependía del "cruce exacto" y por eso podía pasarse días sin operar.
-    # ahora mientras la estructura siga fuerte, la señal puede seguir siendo válida.
-    new_bull = bull_strong
-    new_bear = bear_strong
+    bull_prev_strong = bull_prev
+    bear_prev_strong = bear_prev
+
+    if USE_SLOPE_FILTER:
+        bull_prev_strong = bull_prev_strong and bull_slope_prev_ok
+        bear_prev_strong = bear_prev_strong and bear_slope_prev_ok
+
+    if USE_SPREAD_FILTER:
+        bull_prev_strong = bull_prev_strong and spread_prev_ok
+        bear_prev_strong = bear_prev_strong and spread_prev_ok
+
+    if USE_PERSISTENCE_FILTER:
+        bull_prev_strong = bull_prev_strong and bull_persist_ok
+        bear_prev_strong = bear_prev_strong and bear_persist_ok
+
+    if REQUIRE_FRESH_SETUP:
+        new_bull = bull_strong and not bull_prev_strong
+        new_bear = bear_strong and not bear_prev_strong
+    else:
+        new_bull = bull_strong
+        new_bear = bear_strong
 
     trend_bull = close_now > ema200_now and e1_now > ema200_now
     trend_bear = close_now < ema200_now and e1_now < ema200_now
@@ -675,23 +865,39 @@ def analizar():
     daily_ctx = analizar_contexto_diario()
     macro_bull_ok = (not USE_DAILY_MACRO_FILTER) or daily_ctx["macro_bull"]
     macro_bear_ok = (not USE_DAILY_MACRO_FILTER) or daily_ctx["macro_bear"]
-    daily_vol_ok = (not USE_DAILY_VOL_FILTER) or (daily_ctx["daily_atr_perc"] >= DAILY_ATR_PERC_MIN)
+    daily_vol_ok = (not USE_DAILY_VOL_FILTER) or (
+        daily_ctx["daily_atr_perc"] is not None and daily_ctx["daily_atr_perc"] >= DAILY_ATR_PERC_MIN
+    )
 
     horario_ok = filtro_horario_estadistico()
     dia_ok = filtro_dia_estadistico()
 
     long_signal = (
-        new_bull and trend_bull and htf_bull and
-        atr_ok and impulse_ok and bull_candle and
-        distance_from_ema200 < MAX_DISTANCE_EMA200 and
-        horario_ok and dia_ok and macro_bull_ok and daily_vol_ok
+        new_bull
+        and trend_bull
+        and htf_bull
+        and atr_ok
+        and impulse_ok
+        and bull_candle
+        and MIN_DISTANCE_EMA200 <= distance_from_ema200 <= MAX_DISTANCE_EMA200
+        and horario_ok
+        and dia_ok
+        and macro_bull_ok
+        and daily_vol_ok
     )
 
     short_signal = (
-        new_bear and trend_bear and htf_bear and
-        atr_ok and impulse_ok and bear_candle and
-        distance_from_ema200 < MAX_DISTANCE_EMA200 and
-        horario_ok and dia_ok and macro_bear_ok and daily_vol_ok
+        new_bear
+        and trend_bear
+        and htf_bear
+        and atr_ok
+        and impulse_ok
+        and bear_candle
+        and MIN_DISTANCE_EMA200 <= distance_from_ema200 <= MAX_DISTANCE_EMA200
+        and horario_ok
+        and dia_ok
+        and macro_bear_ok
+        and daily_vol_ok
     )
 
     if ONLY_LONGS_IN_SIGNAL_ENGINE:
@@ -785,25 +991,18 @@ def cerrar_cantidad(exit_price, quantity):
 def abrir_trade(tipo, entry, atr):
     global open_trade
 
-    if tipo == "buy":
-        sl_inicial = round(entry - atr * SL_ATR_MULT, 2)
-        tp1 = round(entry + atr * TP1_ATR_MULT, 2)
-        tp2 = round(entry + atr * TP2_ATR_MULT, 2)
-        tp3 = round(entry + atr * TP3_ATR_MULT, 2)
-    else:
-        sl_inicial = round(entry + atr * SL_ATR_MULT, 2)
-        tp1 = round(entry - atr * TP1_ATR_MULT, 2)
-        tp2 = round(entry - atr * TP2_ATR_MULT, 2)
-        tp3 = round(entry - atr * TP3_ATR_MULT, 2)
+    sl_inicial, tp1, tp2, tp3 = construir_niveles(tipo, entry, atr)
 
-    position_size = calcular_position_size(entry, sl_inicial)
+    raw_position_size = calcular_position_size_por_riesgo(entry, sl_inicial)
+    position_size = ajustar_position_size(entry, raw_position_size)
+
     if position_size <= 0:
         return False
 
     if not trade_valido(entry, atr, position_size):
         return False
 
-    if not tp1_cubre_comisiones_y_gana(tipo, entry, atr, position_size):
+    if not expectativa_suficiente(tipo, entry, atr, position_size):
         return False
 
     block1_size = position_size * BLOCK_1_PERC
@@ -840,7 +1039,7 @@ def abrir_trade(tipo, entry, atr):
     return True
 
 def gestionar_trade(precio_actual):
-    global open_trade, last_trade_close_time
+    global open_trade
 
     if open_trade is None:
         return None
@@ -902,7 +1101,7 @@ def gestionar_trade(precio_actual):
             _, fee, net = cerrar_cantidad(tp3, open_trade["qty_remaining"])
             guardar_trade_cerrado(open_trade, tp3, "TP3")
             open_trade = None
-            last_trade_close_time = datetime.now()
+            registrar_cierre_total("buy", "TP3")
 
             return {
                 "mensaje": (
@@ -921,7 +1120,7 @@ def gestionar_trade(precio_actual):
                 _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
                 guardar_trade_cerrado(open_trade, sl_actual, "SL_despues_TP2")
                 open_trade = None
-                last_trade_close_time = datetime.now()
+                registrar_cierre_total("buy", "SL_despues_TP2")
 
                 return {
                     "mensaje": (
@@ -938,7 +1137,7 @@ def gestionar_trade(precio_actual):
                 _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
                 guardar_trade_cerrado(open_trade, sl_actual, "SL_despues_TP1")
                 open_trade = None
-                last_trade_close_time = datetime.now()
+                registrar_cierre_total("buy", "SL_despues_TP1")
 
                 return {
                     "mensaje": (
@@ -955,7 +1154,7 @@ def gestionar_trade(precio_actual):
                 _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
                 guardar_trade_cerrado(open_trade, sl_actual, "SL")
                 open_trade = None
-                last_trade_close_time = datetime.now()
+                registrar_cierre_total("buy", "SL")
 
                 return {
                     "mensaje": (
@@ -1015,7 +1214,7 @@ def gestionar_trade(precio_actual):
             _, fee, net = cerrar_cantidad(tp3, open_trade["qty_remaining"])
             guardar_trade_cerrado(open_trade, tp3, "TP3")
             open_trade = None
-            last_trade_close_time = datetime.now()
+            registrar_cierre_total("sell", "TP3")
 
             return {
                 "mensaje": (
@@ -1034,7 +1233,7 @@ def gestionar_trade(precio_actual):
                 _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
                 guardar_trade_cerrado(open_trade, sl_actual, "SL_despues_TP2")
                 open_trade = None
-                last_trade_close_time = datetime.now()
+                registrar_cierre_total("sell", "SL_despues_TP2")
 
                 return {
                     "mensaje": (
@@ -1051,7 +1250,7 @@ def gestionar_trade(precio_actual):
                 _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
                 guardar_trade_cerrado(open_trade, sl_actual, "SL_despues_TP1")
                 open_trade = None
-                last_trade_close_time = datetime.now()
+                registrar_cierre_total("sell", "SL_despues_TP1")
 
                 return {
                     "mensaje": (
@@ -1068,7 +1267,7 @@ def gestionar_trade(precio_actual):
                 _, fee, net = cerrar_cantidad(sl_actual, open_trade["qty_remaining"])
                 guardar_trade_cerrado(open_trade, sl_actual, "SL")
                 open_trade = None
-                last_trade_close_time = datetime.now()
+                registrar_cierre_total("sell", "SL")
 
                 return {
                     "mensaje": (
@@ -1102,17 +1301,18 @@ def main():
             enviar_mensaje(f"⚠️ Error leyendo balance Kraken: {e}")
 
     enviar_mensaje(
-        f"🚀 BRAVUS BOT PRO DATA ACTIVADO\n"
+        f"🚀 BRAVUS BOT PRO FEES REALES ACTIVADO\n"
         f"Par: {PAIR}\n"
         f"TF: {INTERVAL}m | HTF: {HTF_INTERVAL}m\n"
         f"Modo trading real: {'ON' if LIVE_TRADING else 'OFF'}\n"
         f"Spot real solo BUY: {'SÍ' if REAL_TRADING_SPOT_ONLY_LONG else 'NO'}\n"
         f"Balance inicial simulado: {round(sim_balance, 2)} €\n"
         f"Riesgo por trade: {round(RISK_PER_TRADE * 100, 2)}%\n"
-        f"Comisión simulada por lado: {round(TAKER_FEE_RATE * 100, 4)}%\n"
-        f"Filtro datos horario activo: {'SÍ' if USE_DATA_TIME_FILTER else 'NO'}\n"
+        f"Taker fee simulada: {round(TAKER_FEE_RATE * 100, 2)}%\n"
+        f"Maker fee referencia: {round(MAKER_FEE_RATE * 100, 2)}%\n"
         f"Filtro macro diario activo: {'SÍ' if USE_DAILY_MACRO_FILTER else 'NO'}\n"
-        f"Filtro volatilidad diaria activo: {'SÍ' if USE_DAILY_VOL_FILTER else 'NO'}"
+        f"Solo setups frescos: {'SÍ' if REQUIRE_FRESH_SETUP else 'NO'}\n"
+        f"Bloqueo tras SL inicial mismo lado: {int(BLOCK_SAME_SIDE_AFTER_INITIAL_SL_SECONDS / 60)} min"
     )
 
     while True:
@@ -1136,7 +1336,8 @@ def main():
                 f"MacroBull: {data['macro_bull_ok']} | DailyVol: {data['daily_vol_ok']} | "
                 f"OpenTrade: {open_trade['type'] if open_trade else 'NO'} | "
                 f"Cooldown: {segundos_cooldown_restantes()} | Balance: {round(sim_balance, 2)} € | "
-                f"DD max: {round(max_drawdown_perc, 2)}%",
+                f"DD max: {round(max_drawdown_perc, 2)}% | "
+                f"SL buy hoy: {initial_sl_side_count['buy']} | SL sell hoy: {initial_sl_side_count['sell']}",
                 flush=True
             )
 
@@ -1162,82 +1363,102 @@ def main():
                 mensaje = None
 
                 if data["long"]:
-                    senal = "buy"
+                    side_ok, side_reason = puede_abrir_side("buy")
 
-                    sl_inicial = round(precio - atr * SL_ATR_MULT, 2)
-                    tp1 = round(precio + atr * TP1_ATR_MULT, 2)
-                    tp2 = round(precio + atr * TP2_ATR_MULT, 2)
-                    tp3 = round(precio + atr * TP3_ATR_MULT, 2)
-                    position_size = calcular_position_size(precio, sl_inicial)
-
-                    if not trade_valido(precio, atr, position_size):
-                        print("Trade BUY descartado por comisiones", flush=True)
-                        trade_descartado = True
-                    elif not tp1_cubre_comisiones_y_gana("buy", precio, atr, position_size):
-                        print("Trade BUY descartado: TP1 no cubre fees con beneficio", flush=True)
-                        trade_descartado = True
+                    if not side_ok:
+                        print(f"BUY bloqueado: {side_reason}", flush=True)
                     else:
-                        entry_fee_est = precio * position_size * TAKER_FEE_RATE
-                        mensaje = (
-                            f"🟢 BRAVUS BOT PRO - BUY\n"
-                            f"Par: {PAIR}\n"
-                            f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"Precio: {precio}\n"
-                            f"SL inicial: {sl_inicial}\n"
-                            f"TP1: {tp1}\n"
-                            f"TP2: {tp2}\n"
-                            f"TP3: {tp3}\n"
-                            f"EMA200: {ema200}\n"
-                            f"HTF: {data['htf']}\n"
-                            f"Spread: {round(data['spread_rel'], 5)}\n"
-                            f"ATR: {round(atr, 2)}\n"
-                            f"ATR%: {round(data['atr_perc'], 5)}\n"
-                            f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
-                            f"BodyRatio: {round(data['body_ratio'], 2)}\n"
-                            f"Daily ATR%: {round(data['daily_atr_perc'], 4)}\n"
-                            f"Tamaño posición: {round(position_size, 6)}\n"
-                            f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
-                            f"Balance: {round(sim_balance, 2)} €"
-                        )
+                        senal = "buy"
+
+                        sl_inicial, tp1, tp2, tp3 = construir_niveles("buy", precio, atr)
+                        raw_position_size = calcular_position_size_por_riesgo(precio, sl_inicial)
+                        position_size = ajustar_position_size(precio, raw_position_size)
+                        perfil = perfil_esperado_trade("buy", precio, atr, position_size) if position_size > 0 else None
+
+                        if position_size <= 0:
+                            print("Trade BUY descartado: tamaño 0", flush=True)
+                            trade_descartado = True
+                        elif not trade_valido(precio, atr, position_size):
+                            print("Trade BUY descartado por relación movimiento/fees", flush=True)
+                            trade_descartado = True
+                        elif not expectativa_suficiente("buy", precio, atr, position_size):
+                            print("Trade BUY descartado: expectativa neta insuficiente", flush=True)
+                            trade_descartado = True
+                        else:
+                            entry_fee_est = precio * position_size * TAKER_FEE_RATE
+                            mensaje = (
+                                f"🟢 BRAVUS BOT PRO - BUY\n"
+                                f"Par: {PAIR}\n"
+                                f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"Precio: {precio}\n"
+                                f"SL inicial: {sl_inicial}\n"
+                                f"TP1: {tp1}\n"
+                                f"TP2: {tp2}\n"
+                                f"TP3: {tp3}\n"
+                                f"EMA200: {ema200}\n"
+                                f"HTF: {data['htf']}\n"
+                                f"Spread: {round(data['spread_rel'], 5)}\n"
+                                f"ATR: {round(atr, 2)}\n"
+                                f"ATR%: {round(data['atr_perc'], 5)}\n"
+                                f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
+                                f"BodyRatio: {round(data['body_ratio'], 2)}\n"
+                                f"Daily ATR%: {round(data['daily_atr_perc'], 4) if data['daily_atr_perc'] is not None else 'OFF'}\n"
+                                f"Tamaño posición: {round(position_size, 6)}\n"
+                                f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
+                                f"Neto bloqueado si toca TP1: {round(perfil['net_after_tp1'], 2)} €\n"
+                                f"Neto esperado completo: {round(perfil['net_full'], 2)} €\n"
+                                f"RR neto esperado: {round(perfil['full_rr'], 2)}\n"
+                                f"Balance: {round(sim_balance, 2)} €"
+                            )
 
                 elif data["short"]:
-                    senal = "sell"
+                    side_ok, side_reason = puede_abrir_side("sell")
 
-                    sl_inicial = round(precio + atr * SL_ATR_MULT, 2)
-                    tp1 = round(precio - atr * TP1_ATR_MULT, 2)
-                    tp2 = round(precio - atr * TP2_ATR_MULT, 2)
-                    tp3 = round(precio - atr * TP3_ATR_MULT, 2)
-                    position_size = calcular_position_size(precio, sl_inicial)
-
-                    if not trade_valido(precio, atr, position_size):
-                        print("Trade SELL descartado por comisiones", flush=True)
-                        trade_descartado = True
-                    elif not tp1_cubre_comisiones_y_gana("sell", precio, atr, position_size):
-                        print("Trade SELL descartado: TP1 no cubre fees con beneficio", flush=True)
-                        trade_descartado = True
+                    if not side_ok:
+                        print(f"SELL bloqueado: {side_reason}", flush=True)
                     else:
-                        entry_fee_est = precio * position_size * TAKER_FEE_RATE
-                        mensaje = (
-                            f"🔴 BRAVUS BOT PRO - SELL\n"
-                            f"Par: {PAIR}\n"
-                            f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"Precio: {precio}\n"
-                            f"SL inicial: {sl_inicial}\n"
-                            f"TP1: {tp1}\n"
-                            f"TP2: {tp2}\n"
-                            f"TP3: {tp3}\n"
-                            f"EMA200: {ema200}\n"
-                            f"HTF: {data['htf']}\n"
-                            f"Spread: {round(data['spread_rel'], 5)}\n"
-                            f"ATR: {round(atr, 2)}\n"
-                            f"ATR%: {round(data['atr_perc'], 5)}\n"
-                            f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
-                            f"BodyRatio: {round(data['body_ratio'], 2)}\n"
-                            f"Daily ATR%: {round(data['daily_atr_perc'], 4)}\n"
-                            f"Tamaño posición: {round(position_size, 6)}\n"
-                            f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
-                            f"Balance: {round(sim_balance, 2)} €"
-                        )
+                        senal = "sell"
+
+                        sl_inicial, tp1, tp2, tp3 = construir_niveles("sell", precio, atr)
+                        raw_position_size = calcular_position_size_por_riesgo(precio, sl_inicial)
+                        position_size = ajustar_position_size(precio, raw_position_size)
+                        perfil = perfil_esperado_trade("sell", precio, atr, position_size) if position_size > 0 else None
+
+                        if position_size <= 0:
+                            print("Trade SELL descartado: tamaño 0", flush=True)
+                            trade_descartado = True
+                        elif not trade_valido(precio, atr, position_size):
+                            print("Trade SELL descartado por relación movimiento/fees", flush=True)
+                            trade_descartado = True
+                        elif not expectativa_suficiente("sell", precio, atr, position_size):
+                            print("Trade SELL descartado: expectativa neta insuficiente", flush=True)
+                            trade_descartado = True
+                        else:
+                            entry_fee_est = precio * position_size * TAKER_FEE_RATE
+                            mensaje = (
+                                f"🔴 BRAVUS BOT PRO - SELL\n"
+                                f"Par: {PAIR}\n"
+                                f"Hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"Precio: {precio}\n"
+                                f"SL inicial: {sl_inicial}\n"
+                                f"TP1: {tp1}\n"
+                                f"TP2: {tp2}\n"
+                                f"TP3: {tp3}\n"
+                                f"EMA200: {ema200}\n"
+                                f"HTF: {data['htf']}\n"
+                                f"Spread: {round(data['spread_rel'], 5)}\n"
+                                f"ATR: {round(atr, 2)}\n"
+                                f"ATR%: {round(data['atr_perc'], 5)}\n"
+                                f"Dist EMA200: {round(data['distance_from_ema200'], 5)}\n"
+                                f"BodyRatio: {round(data['body_ratio'], 2)}\n"
+                                f"Daily ATR%: {round(data['daily_atr_perc'], 4) if data['daily_atr_perc'] is not None else 'OFF'}\n"
+                                f"Tamaño posición: {round(position_size, 6)}\n"
+                                f"Fee entrada estimada: {round(entry_fee_est, 2)} €\n"
+                                f"Neto bloqueado si toca TP1: {round(perfil['net_after_tp1'], 2)} €\n"
+                                f"Neto esperado completo: {round(perfil['net_full'], 2)} €\n"
+                                f"RR neto esperado: {round(perfil['full_rr'], 2)}\n"
+                                f"Balance: {round(sim_balance, 2)} €"
+                            )
 
                 puede_enviar = (
                     ultimo_envio is None or
