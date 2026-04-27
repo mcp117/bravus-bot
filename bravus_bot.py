@@ -38,8 +38,8 @@ REAL_TRADING_SPOT_ONLY_LONG = True    # En spot real no se permite short real
 # MERCADO
 # ==============================
 PAIR = "XBTUSD"
-INTERVAL = 1
-HTF_INTERVAL = 5
+INTERVAL = 5
+HTF_INTERVAL = 15
 DAILY_INTERVAL = 1440
 
 # ==============================
@@ -53,12 +53,11 @@ LEN_EMA5 = 50
 LEN_EMA6 = 60
 LEN_EMA_TREND = 200
 
-# Más estricto que antes
-MIN_SPREAD_PERC = 0.0011
-BARS_FOR_TREND_HOLD = 4
+MIN_SPREAD_PERC = 0.0009
+BARS_FOR_TREND_HOLD = 3
 ATR_LENGTH = 14
 ATR_MIN_MULT = 0.8
-MIN_BODY_RATIO = 0.70
+MIN_BODY_RATIO = 0.62
 
 USE_SLOPE_FILTER = True
 USE_SPREAD_FILTER = True
@@ -70,12 +69,12 @@ USE_IMPULSE_FILTER = True
 # RIESGO / OBJETIVOS
 # ==============================
 SL_ATR_MULT = 1.6
-TP1_ATR_MULT = 2.8
-TP2_ATR_MULT = 4.2
-TP3_ATR_MULT = 6.2
+TP1_ATR_MULT = 3.0
+TP2_ATR_MULT = 4.5
+TP3_ATR_MULT = 6.5
 
 CHECK_EVERY_SECONDS = 60
-MINUTES_BETWEEN_SIGNALS = 20
+MINUTES_BETWEEN_SIGNALS = 30
 
 TRADES_FILE = "trades.csv"
 BALANCE_FILE = "balance_log.csv"
@@ -87,42 +86,37 @@ INITIAL_BALANCE = 1000.0
 RISK_PER_TRADE = 0.0025               # 0.25%
 MAX_DAILY_LOSS_PERC = 0.03
 
-# Kraken spot market -> taker realista base
-# maker base spot estándar: 0.23%
-# taker base spot estándar: 0.40%
-# usamos taker en entrada y salida para ser conservadores
+# Fees conservadoras tipo taker spot
 MAKER_FEE_RATE = 0.0023
 TAKER_FEE_RATE = 0.0040
 
-MIN_ATR_PERC = 0.00085
-MIN_DISTANCE_EMA200 = 0.0030
-MAX_DISTANCE_EMA200 = 0.0120
+MIN_ATR_PERC = 0.0007
+MIN_DISTANCE_EMA200 = 0.0025
+MAX_DISTANCE_EMA200 = 0.0160
 
 COOLDOWN_SECONDS = 600
-BLOCK_SAME_SIDE_AFTER_INITIAL_SL_SECONDS = 2700  # 45 min tras SL inicial
+BLOCK_SAME_SIDE_AFTER_INITIAL_SL_SECONDS = 2700  # 45 min
 
 BLOCK_1_PERC = 0.50
 BLOCK_2_PERC = 0.30
 BLOCK_3_PERC = 0.20
 
-# Para que el trade tenga sentido neto tras fees reales
-MIN_LOCKED_NET_AFTER_TP1 = 1.00
-MIN_FULL_NET_PROFIT = 2.00
-MIN_FULL_NET_RR = 1.15
+MIN_LOCKED_NET_AFTER_TP1 = 0.60
+MIN_FULL_NET_PROFIT = 1.20
+MIN_FULL_NET_RR = 1.00
 
-# Límites de realismo spot / control de costes
-MAX_NOTIONAL_BALANCE_PERC = 0.95      # no usar más del 95% del balance como nominal
-MAX_FEE_TO_RISK_RATIO = 0.60          # roundtrip fees <= 60% del riesgo del trade
+MAX_NOTIONAL_BALANCE_PERC = 0.95
+MAX_FEE_TO_RISK_RATIO = 0.85
 
 # Control de rachas malas
 MAX_INITIAL_SL_PER_SIDE = 2
 MAX_INITIAL_SL_TOTAL_PER_DAY = 3
 
 # ==============================
-# FILTROS OPCIONALES BASADOS EN DATOS
+# FILTROS BASADOS EN DATOS
 # ==============================
 USE_DATA_TIME_FILTER = False
-USE_DAILY_MACRO_FILTER = True
+USE_DAILY_MACRO_FILTER = False
 USE_DAILY_VOL_FILTER = False
 
 ALLOWED_UTC_HOURS = {4, 5, 6, 7, 8, 9, 17, 18, 19, 20}
@@ -130,11 +124,7 @@ ALLOWED_WEEKDAYS = {0, 1, 2, 4}
 
 DAILY_ATR_PERC_MIN = 0.03
 
-# En simulación dejamos BUY y SELL.
-# Si más adelante quieres solo largos, ponlo en True.
 ONLY_LONGS_IN_SIGNAL_ENGINE = False
-
-# Si quieres muy pocas entradas y muy limpias, déjalo en True
 REQUIRE_FRESH_SETUP = True
 
 # ==============================
@@ -406,7 +396,6 @@ def registrar_cierre_total(side: str, resultado: str):
             seconds=BLOCK_SAME_SIDE_AFTER_INITIAL_SL_SECONDS
         )
     else:
-        # Un trade gestionado en beneficio resetea la racha de SL de ese lado
         initial_sl_side_count[side] = 0
 
 # ==============================
@@ -581,7 +570,6 @@ def max_position_size_por_fee_budget(entry):
     if entry <= 0:
         return 0.0
 
-    # Presupuesto máximo de comisiones roundtrip
     max_fee_budget = calcular_risk_amount() * MAX_FEE_TO_RISK_RATIO
     fee_per_unit_roundtrip = entry * TAKER_FEE_RATE * 2
 
@@ -626,12 +614,10 @@ def perfil_esperado_trade(tipo, entry, atr, position_size):
 
     entry_fee_total = entry * position_size * TAKER_FEE_RATE
 
-    # Pérdida si salta SL inicial en todo
     gross_sl = calcular_pnl_bruto_simple(tipo, entry, sl, position_size)
     exit_fee_sl = sl * position_size * TAKER_FEE_RATE
     net_sl = gross_sl - entry_fee_total - exit_fee_sl
 
-    # Beneficio mínimo bloqueado si toca TP1 y luego vuelve a TP1
     gross_after_tp1 = (
         calcular_pnl_bruto_simple(tipo, entry, tp1, b1) +
         calcular_pnl_bruto_simple(tipo, entry, tp1, b2) +
@@ -640,7 +626,6 @@ def perfil_esperado_trade(tipo, entry, atr, position_size):
     exit_fee_after_tp1 = tp1 * (b1 + b2 + b3) * TAKER_FEE_RATE
     net_after_tp1 = gross_after_tp1 - entry_fee_total - exit_fee_after_tp1
 
-    # Beneficio si toca TP2 y luego vuelve a TP2
     gross_after_tp2 = (
         calcular_pnl_bruto_simple(tipo, entry, tp1, b1) +
         calcular_pnl_bruto_simple(tipo, entry, tp2, b2) +
@@ -653,7 +638,6 @@ def perfil_esperado_trade(tipo, entry, atr, position_size):
     )
     net_after_tp2 = gross_after_tp2 - entry_fee_total - exit_fee_after_tp2
 
-    # Beneficio completo
     gross_full = (
         calcular_pnl_bruto_simple(tipo, entry, tp1, b1) +
         calcular_pnl_bruto_simple(tipo, entry, tp2, b2) +
@@ -1301,7 +1285,7 @@ def main():
             enviar_mensaje(f"⚠️ Error leyendo balance Kraken: {e}")
 
     enviar_mensaje(
-        f"🚀 BRAVUS BOT PRO FEES REALES ACTIVADO\n"
+        f"🚀 BRAVUS BOT PRO 5M/15M ACTIVADO\n"
         f"Par: {PAIR}\n"
         f"TF: {INTERVAL}m | HTF: {HTF_INTERVAL}m\n"
         f"Modo trading real: {'ON' if LIVE_TRADING else 'OFF'}\n"
